@@ -17,8 +17,8 @@ WELCOME = (
     "• подробно разобрать продукт/услугу;\n"
     "• провести анализ ЦА по JTBD.\n\n"
     "🔐 Чтобы начать, пожалуйста, подтверди согласие с "
-    "[Политикой конфиденциальности](https://docs.google.com/document/d/1UUyKq7aCbtrOT81VBVwgsOipjtWpro7v/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true) и "
-    "[Договором‑офертой](https://533baa06-ee8c-4f9f-a849-1e8a7826bc45-00-2qjxcpo7ji57w.janeway.replit.dev/).\n\n"
+    "[\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u043e\u0439 \u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438](https://docs.google.com/document/d/1UUyKq7aCbtrOT81VBVwgsOipjtWpro7v/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true) и "
+    "[\u0414\u043e\u0433\u043e\u0432\u043e\u0440\u043e\u043c‑\u043e\u0444\u0435\u0440\u0442\u043e\u0439](https://533baa06-ee8c-4f9f-a849-1e8a7826bc45-00-2qjxcpo7ji57w.janeway.replit.dev/).\n\n"
     "✅ Просто нажми «СОГЛАСЕН/СОГЛАСНА», чтобы стартовать."
 )
 
@@ -52,7 +52,7 @@ async def get_feedback(text):
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=60
+            max_tokens=200
         )
         return response.choices[0].message.content.strip()
     except:
