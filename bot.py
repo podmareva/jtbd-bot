@@ -135,14 +135,34 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sess["answers"].append(text)
         cmpt = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[{"role":"system","content":"Ты — эксперт, на «ты», комментируй ответ коротко по делу."},
+            messages=[{"role":"system","content":"Ты — вовлечённый бренд‑эксперт. Отвечай дружелюбно, на «ты», 1‑2 предложениями: поддержи, подчеркни смысл, вдохнови."},
                       {"role":"user","content":text}]
         )
         await ctx.bot.send_message(chat_id=cid, text=cmpt.choices[0].message.content)
         idx = len(sess["answers"])
-        await ctx.bot.send_message(chat_id=cid, text=(INTERVIEW_Q[idx] if idx<15 else ""))
-        if idx == 15:
+        if idx < len(INTERVIEW_Q):
+            # задаём следующий вопрос
+            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
+        else:
+            # 15 ответов получены ➜ формируем распаковку
             sess["stage"] = "done_interview"
+
+            summary_prompt = (
+                "Ты — стратег‑психолог. На основе ответов (не повторяй их дословно) "
+                "сделай глубокую распаковку личности:\n"
+                "1. Ценности\n2. Мотивация\n3. Сильные стороны и уникальность\n"
+                "4. Позиционирование\n5. Ядро сообщений. Обращайся на «ты», тепло и вдохновляюще."
+            )
+            full = "\n".join(sess["answers"])
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role":"system","content":summary_prompt},
+                          {"role":"user","content":full}]
+            )
+            await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + resp.choices[0].message.content)
+
+            kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in MAIN_MENU]
+            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if sess["stage"] == "product_ask":
