@@ -20,8 +20,8 @@ WELCOME = (
     "• подробно разобрать продукт/услугу;\n"
     "• провести анализ ЦА по JTBD.\n\n"
     "🔐 Чтобы начать, подтверди согласие с "
-    "[Политикой конфиденциальности](https://docs.google.com/document/d/1UUyKq7aCbtrOT81VBVwgsOipjtWpro7v/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true) и "
-    "[Договором‑офертой](https://docs.google.com/document/d/1zY2hl0ykUyDYGQbSygmcgY2JaVMMZjQL/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true).\n\n"
+    "[Политикой конфиденциальности](https://docs.google.com/…) и "
+    "[Договором‑офертой](https://docs.google.com/…).\n\n"
     "✅ Нажми «СОГЛАСЕН/СОГЛАСНА» — и поехали!"
 )
 
@@ -66,7 +66,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sess["answers"] = []
         await ctx.bot.send_message(chat_id=cid, text=(
             "✅ Спасибо за согласие!\n\n"
-            "Теперь начнём с распаковки личности.\n"
+            "Теперь начнём распаковку личности.\n"
             "Я задам тебе *15 вопросов* — отвечай просто и честно 👇"
         ), parse_mode="Markdown")
         await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[0])
@@ -79,13 +79,14 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if sess["stage"] == "interview":
+        # Сохраняем ответ
         sess["answers"].append(text)
 
-        # 📌 Комментарий по ответу — дружелюбный, на «ты», без уточняющих вопросов
+        # Комментируем по теме
         cmpt = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role":"system","content":"Ты — эксперт, пиши дружелюбно на «ты», дай короткий комментарий по делу, без вопросов."},
+                {"role":"system","content":"Ты — эксперт, пиши дружелюбно на «ты», дай короткий и по делу комментарий по ответу."},
                 {"role":"user","content":text}
             ]
         )
@@ -93,30 +94,32 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         idx = len(sess["answers"])
         if idx < len(INTERVIEW_Q):
+            # Следующий вопрос
             await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
         else:
+            # Итоговая распаковка
             sess["stage"] = "done_interview"
-            # 📝 Итоговая распаковка
             summary = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {"role":"system","content":(
-                        "Ты — эксперт, обратись на «ты», структурно составь распаковку личности и экспертности:\n"
+                        "Ты — эксперт, пиши на «ты», структурированно составь распаковку личности и экспертности:\n"
                         "1. Ценности\n2. Мотивация\n3. Сильные стороны и уникальность\n"
                         "4. Позиционирование\n5. Что транслируешь аудитории"
                     )},
                     {"role":"user","content":"\n".join(sess["answers"])}
                 ]
             ).choices[0].message.content
-            await ctx.bot.send_message(chat_id=cid, text="✅ Распаковка готова:\n\n" + summary)
+            await ctx.bot.send_message(chat_id=cid, text="✅ Вот твоя полная распаковка:\n\n" + summary)
+            
             kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in MAIN_MENU]
             await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif sess["stage"] == "done_interview" and text.lower() == "bio":
         sess["stage"] = "bio"
         prompt = (
-            "Сформируй 3 варианта BIO — каждый с 3 тезисами до 180 символов, обратись на «ты»:"
-            "\nОтветы клиента:\n" + "\n".join(sess["answers"])
+            "Сформируй 3 варианта BIO, каждое — 3 тезиса по 180 символов, дружелюбно на «ты». Ответы:\n"
+            + "\n".join(sess["answers"])
         )
         resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}])
         await ctx.bot.send_message(chat_id=cid, text=resp.choices[0].message.content)
@@ -145,9 +148,9 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif sess["stage"] == "done_product" and text.lower() == "jtbd":
         prompt = (
-            "Анализ ЦА по JTBD на основе ответов:\n"
+            "Анализ ЦА по JTBD на основе:\n"
             + "\n".join(sess["answers"]) + "\n" + "\n".join(sess["product_answers"])
-            + "\nВключи три неочевидных сегмента, обратись на «ты»."
+            + "\nВсего 3 неочевидных сегмента, дружелюбно на «ты»."
         )
         resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}])
         await ctx.bot.send_message(chat_id=cid, text=resp.choices[0].message.content)
@@ -165,7 +168,7 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id=cid, text=msgs[key])
 
     else:
-        await ctx.bot.send_message(chat_id=cid, text="Пиши /start или используй кнопки выше.")
+        await ctx.bot.send_message(chat_id=cid, text="Нажимай кнопки меню или пиши /start для старта.")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
