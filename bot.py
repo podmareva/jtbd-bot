@@ -184,5 +184,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.run_polling()
 
+iimport asyncio
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
