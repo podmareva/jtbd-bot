@@ -178,40 +178,48 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
 
-    if sess["stage"] == "interview":
+        if sess["stage"] == "interview":
         sess["answers"].append(text)
+        # дружелюбный микро‑комментарий
         comment = ask_openai([
-            {"role": "system", "content": "Ты — эксперт, дружелюбно на «ты», 1–2 предложения поддержки."},
+            {"role": "system",
+             "content": "Ответь одним тёплым предложением поддержки, без вопросов, на \"ты\""},
             {"role": "user", "content": text}
         ])
-        await ctx.bot.send_message(chat_id=cid, text=comment)
+        await ctx.bot.send_message(cid, comment)
+
         idx = len(sess["answers"])
-        if idx < len(INTERVIEW_Q):
-            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
-        else:
-            sess["stage"] = "done_interview"
-            full = "\n".join(sess["answers"])
-            summary = ask_openai([
-                {"role": "system", "content": (
-                    "Ты — стратег‑психолог.\nСоставь глубокую распаковку:\n"
-                    "1. Ценности\n2. Мотивация\n3. Сильные стороны и уникальность\n"
-                    "4. Позиционирование\n5. Ядро сообщений\n"
-                    "Пиши дружелюбно, на «ты»."
-                )},
-                {"role": "user", "content": full}
-            ])
-            positioning = ask_openai([
-                {"role": "system", "content": (
-                    "На основе распаковки сформулируй чёткое позиционирование: ниша, ценность, отличие."
-                )},
-                {"role": "user", "content": summary}
-            ])
-            sess["positioning"] = positioning
-            # Отправляем по частям:
-            chunk_send(ctx.bot, cid, "✅ Твоя распаковка:\n\n" + summary)
-            chunk_send(ctx.bot, cid, "🎯 Позиционирование:\n\n" + positioning)
-            kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
-            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+        if idx < len(INTERVIEW_Q):                              #  ←  осталось >0 вопросов
+            await ctx.bot.send_message(cid, INTERVIEW_Q[idx])
+            return                                               #  ←  выходим, ждём ответа
+
+        # ----- ниже код выполнится ОДИН РАЗ после 15‑го ответа -----
+        sess["stage"] = "done_interview"
+
+        # 1. Глубокая распаковка
+        full_answers = "\n".join(sess["answers"])
+        unpack = ask_openai([
+            {"role": "system",
+             "content": ("Ты стратег‑психолог. Сделай структурную распаковку: "
+                         "ценности, мотивация, сильные стороны, уникальность.")},
+            {"role": "user", "content": full_answers}
+        ])
+
+        # 2. Позиционирование
+        positioning = ask_openai([
+            {"role": "system",
+             "content": "Сформулируй чёткое позиционирование: ниша, ценность, отличие."},
+            {"role": "user", "content": unpack}
+        ])
+        sess["positioning"] = positioning
+
+        # отправляем по частям, чтобы не обрезалось
+        chunk_send(ctx.bot, cid, "✅ Твоя распаковка:\n\n" + unpack)
+        chunk_send(ctx.bot, cid, "🎯 Позиционирование:\n\n" + positioning)
+
+        # меню
+        kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
+        await ctx.bot.send_message(cid, "Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if sess["stage"] == "product_ask":
