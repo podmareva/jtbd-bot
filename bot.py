@@ -54,41 +54,33 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    query = update.callback_query
-    data = query.data
-    sess = sessions.get(cid)
-    await query.answer()
-    if not sess:
-        return
+    query = update.callback_query; data = query.data
+    sess = sessions.get(cid); await query.answer()
+    if not sess: return
 
     if sess["stage"] == "welcome" and data == "agree":
-        sess["stage"] = "interview"
-        sess["answers"] = []
-        await ctx.bot.send_message(chat_id=cid, text=(
-            "✅ Спасибо за согласие!\n\n"
-            "Начнём распаковку личности. Отвечай просто и честно на 15 вопросов 👇"
-        ))
-        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[0])
-        return
+        sess["stage"] = "interview"; sess["answers"] = []
+        await ctx.bot.send_message(chat_id=cid, text="✅ Спасибо! Давай распаковываться. Поехали👇")
+        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[0]); return
 
-    # Блок для кнопок после распаковки
+    # BIO
     if sess["stage"] == "done_interview" and data == "bio":
-        sess["stage"] = "bio"
-        await generate_bio(cid, sess, ctx)
-        return
+        sess["stage"] = "bio"; await generate_bio(cid, sess, ctx); return
+    # Product
     if sess["stage"] in ("done_interview", "done_bio") and data == "product":
-        sess["stage"] = "product_ask"
-        sess["product_answers"] = []
-        await ctx.bot.send_message(chat_id=cid, text="Расскажи о своём продукте/услуге и кому он помогает.")
-        return
-    if sess["stage"] in ("done_interview", "done_bio", "done_product") and data == "jtbd":
-        await run_jtbd(cid, sess, ctx)
-        return
+        sess["stage"] = "product_ask"; sess["product_answers"] = []
+        await ctx.bot.send_message(chat_id=cid, text="Расскажи о своём продукте/услуге — ярко и живо, как если бы презентовала его потенциальному клиенту."); return
+    # JTBD
+    if sess["stage"] in ("done_interview","done_bio","done_product") and data == "jtbd":
+        await start_jtbd(cid, sess, ctx); return
+    return
 
 async def generate_bio(cid, sess, ctx):
     prompt = (
-        "Сформируй 3 варианта BIO (каждый — 3 тезиса до 180 символов, дружелюбно на «ты»):\n"
-        + "\n".join(sess["answers"])
+        "Сформируй 3 варианта BIO для Инстаграм:\n"
+        f"- Каждый вариант: 3–4 цепляющих тезиса (до 180 символов).\n"
+        "- Говорим дружелюбно, на «ты».\n"
+        "Ответы:\n" + "\n".join(sess["answers"])
     )
     resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}])
     await ctx.bot.send_message(chat_id=cid, text=resp.choices[0].message.content)
@@ -96,91 +88,95 @@ async def generate_bio(cid, sess, ctx):
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in MAIN_MENU if c!="bio"]
     await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
 
-async def run_jtbd(cid, sess, ctx):
-    prompt = (
-        "Сделай глубокий анализ ЦА по JTBD на основе распаковки и описания продукта. "
-        "Выдели 3 неочевидных сегмента, потребности, боли, триггеры, барьеры, альтернативы. Обращайся на «ты»."
+async def start_jtbd(cid, sess, ctx):
+    # Сначала собираем базовые сегменты
+    prompt0 = (
+        "На основе распаковки и продукта выдели 3–4 основных сегмента целевой аудитории.\n"
+        "Структурировано: название сегмента + краткое описание."
+        "\nОтветь дружелюбно, на «ты»."
     )
-    window = "\n".join(sess["answers"] + sess["product_answers"])
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content": prompt + "\n\n" + window}])
+    resp0 = openai.ChatCompletion.create(model="gpt-3.5-turbo",
+        messages=[{"role":"user","content":prompt0 + "\n\n" + "\n".join(sess["answers"] + sess["product_answers"])}])
+    text0 = resp0.choices[0].message.content
+    kb = [[InlineKeyboardButton("Да, дополнительные сегменты", callback_data="more_jtbd")],
+          [InlineKeyboardButton("Хватит, благодарю", callback_data="skip_jtbd")]]
+    await ctx.bot.send_message(chat_id=cid, text=text0, reply_markup=InlineKeyboardMarkup(kb))
+    # переходим в stage jtbd_first
+    sess["stage"] = "jtbd_first"
+
+async def handle_more_jtbd(update, ctx):
+    cid = update.effective_chat.id; sess = sessions[cid]
+    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo",
+        messages=[{"role":"user","content":"Добавь ещё 3 неочевидных сегмента, дружелюбно на «ты»."}])
     await ctx.bot.send_message(chat_id=cid, text=resp.choices[0].message.content)
+    # Переходим к финальному предложению
+    await ctx.bot.send_message(chat_id=cid,
+        text="У меня есть контент‑ассистент — он умеет создавать контент‑стратегии, посты и сценарии.\n\nЧто дальше?",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Получить доступ", callback_data="get_access")],
+                                           [InlineKeyboardButton("Уже в арсенале", callback_data="have")],
+                                           [InlineKeyboardButton("Обращусь позже", callback_data="later")]]))
     sess["stage"] = "done_jtbd"
-    kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in FINAL_MENU]
-    await ctx.bot.send_message(chat_id=cid, text="Выбери, что дальше:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def handle_skip_jtbd(update, ctx):
+    cid = update.effective_chat.id; sess = sessions[cid]
+    await ctx.bot.send_message(chat_id=cid,
+        text="Поняла! У меня есть контент‑ассистент — он умеет создавать контент‑стратегии, посты и сценарии.\n\nЧто дальше?",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Получить доступ", callback_data="get_access")],
+                                           [InlineKeyboardButton("Уже в арсенале", callback_data="have")],
+                                           [InlineKeyboardButton("Обращусь позже", callback_data="later")]]))
+    sess["stage"] = "done_jtbd"
 
 async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    sess = sessions.get(cid)
-    if not sess:
-        return
+    cid = update.effective_chat.id; sess = sessions.get(cid)
+    if not sess: return
     text = update.message.text.strip()
 
     if sess["stage"] == "interview":
         sess["answers"].append(text)
-
         cmpt = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role":"system","content":"Ты — эксперт. Пиши дружелюбно на «ты», дай короткий комментарий по делу."},
-                {"role":"user","content":text}
-            ]
+            messages=[{"role":"system","content":"Ты — эксперт, на «ты», комментируй ответ коротко по делу."},
+                      {"role":"user","content":text}]
         )
         await ctx.bot.send_message(chat_id=cid, text=cmpt.choices[0].message.content)
-
         idx = len(sess["answers"])
-        if idx < len(INTERVIEW_Q):
-            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
-        else:
+        await ctx.bot.send_message(chat_id=cid, text=(INTERVIEW_Q[idx] if idx<15 else ""))
+        if idx == 15:
             sess["stage"] = "done_interview"
-            summary_prompt = (
-                "Ты — стратег‑психолог. Проанализируй ответы (не повторяй дословно) и выдай глубокую распаковку личности:\n"
-                "I. Ключевые ценности (5–7 пунктов)\n"
-                "II. Внутренняя мотивация (2–3 абзаца)\n"
-                "III. Сильные стороны + уникальность\n"
-                "IV. Позиционирование для аудитории\n"
-                "V. Ядро сообщений (5–7 буллетов)\n\n"
-                "Пиши дружелюбно, на «ты»."
-            )
-            full = "\n".join(sess["answers"])
-            resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[
-                {"role":"system","content":summary_prompt},
-                {"role":"user","content":full}
-            ])
-            await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + resp.choices[0].message.content)
-            kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in MAIN_MENU]
-            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if sess["stage"] == "product_ask":
         sess["product_answers"].append(text)
-        questions = ["Какую проблему решает?", "Для кого?", "В чём уникальность?"]
-        idx = len(sess["product_answers"]) - 1
-        if idx < len(questions):
-            await ctx.bot.send_message(chat_id=cid, text=questions[idx])
-        else:
-            prompt = "\n".join(sess["product_answers"])
-            resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}])
-            await ctx.bot.send_message(chat_id=cid, text=resp.choices[0].message.content)
-            sess["stage"] = "done_product"
-            kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in MAIN_MENU if c!="product"]
-            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+        # читаем продукт и сразу выдаём рекомендации
+        prompt = (
+            "Проанализируй описание продукта и дай 3‑4 практических рекомендации:\n"
+            + "\n".join(sess["product_answers"]) + "\n"
+            "Советы: как раскрывать ценность, что улучшить, как презентовать."
+        )
+        resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":prompt}])
+        await ctx.bot.send_message(chat_id=cid, text=resp.choices[0].message.content)
+        sess["stage"] = "done_product"
+        kb = [[InlineKeyboardButton(n, callback_data=c)] for n,c in MAIN_MENU if c!="product"]
+        await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if sess["stage"] == "done_jtbd" and text.lower().replace(" ", "_") in ["get_access","have","later"]:
+    if sess["stage"] == "done_jtbd" and text.lower().replace(" ","_") in ["get_access","have","later"]:
         msgs = {
-            "get_access": "👉 Ссылка на оплату: https://your-link.com",
-            "have": "👏 Отлично, продолжай!",
-            "later": "🚀 Я тут, когда будешь готов(а)."
+            "get_access": "👉 Вот ссылка на оплату контент‑ассистента: https://your-link.com",
+            "have": "👏 Отлично, продолжаешь — супер!",
+            "later": "🚀 Обратись, когда захочешь продолжить."
         }
-        await ctx.bot.send_message(chat_id=cid, text=msgs[text.lower().replace(" ", "_")])
+        await ctx.bot.send_message(chat_id=cid, text=msgs[text.lower().replace(" ","_")])
         return
 
-    await ctx.bot.send_message(chat_id=cid, text="Нажимай кнопки меню или пиши /start для старта.")
+    await ctx.bot.send_message(chat_id=cid, text="👍 Используй кнопки или пиши /start")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CallbackQueryHandler(handle_more_jtbd, pattern="more_jtbd"))
+    app.add_handler(CallbackQueryHandler(handle_skip_jtbd, pattern="skip_jtbd"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.run_polling()
 
