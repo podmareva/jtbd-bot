@@ -8,16 +8,31 @@ from telegram.ext import (
 )
 import openai
 
+# ---------- НАСТРОЙКИ ----------
+
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# Защита от двойного запуска
 if "RUNNING_BOT" in os.environ:
     print("❌ Бот уже запущен. Останови другой процесс, чтобы избежать конфликта.")
     sys.exit(1)
 os.environ["RUNNING_BOT"] = "1"
 
 sessions = {}
+
+WELCOME = (
+    "👋 Привет! Ты в боте «Твоя распаковка и анализ ЦА» — он поможет:\n"
+    "• распаковать твою экспертную личность;\n"
+    "• сформировать позиционирование и BIO;\n"
+    "• подробно разобрать продукт/услугу;\n"
+    "• провести анализ ЦА по JTBD.\n\n"
+    "🔐 Чтобы начать, подтверди согласие с "
+    "[Политикой конфиденциальности](https://docs.google.com/…) и "
+    "[Договором‑офертой](https://docs.google.com/…).\n\n"
+    "✅ Нажми «СОГЛАСЕН/СОГЛАСНА» — и поехали!"
+)
 
 INTERVIEW_Q = [
     "1. Расскажи о своём профессиональном опыте. Чем ты занимаешься?",
@@ -43,27 +58,68 @@ MAIN_MENU = [
     ("🔍 Анализ ЦА", "jtbd")
 ]
 
-WELCOME = (
-    "\U0001F44B Привет! Ты в боте «Твоя распаковка и анализ ЦА» — он поможет:\n"
-    "• распаковать твою экспертную личность;\n"
-    "• сформировать позиционирование и BIO;\n"
-    "• подробно разобрать продукт/услугу;\n"
-    "• провести анализ ЦА по JTBD.\n\n"
-    "\U0001F510 Чтобы начать, подтверди согласие с "
-    "[Политикой конфиденциальности](https://docs.google.com/…) и "
-    "[Договором‑офертой](https://docs.google.com/…).\n\n"
-    "✅ Нажми «СОГЛАСЕН/СОГЛАСНА» — и поехали!"
-)
+# ---------- HANDLERS ----------
 
-async def message_handler(update, ctx):
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    sessions[cid] = {"stage": "welcome", "answers": [], "product_answers": []}
+    kb = [[InlineKeyboardButton("✅ СОГЛАСЕН/СОГЛАСНА", callback_data="agree")]]
+    await ctx.bot.send_message(chat_id=cid, text=WELCOME, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    query = update.callback_query
+    data = query.data
+    sess = sessions.get(cid)
+    await query.answer()
+    if not sess:
+        return
+
+    # --- Согласие ---
+    if sess["stage"] == "welcome" and data == "agree":
+        sess["stage"] = "interview"
+        await ctx.bot.send_message(chat_id=cid,
+                                   text="✅ Спасибо за согласие!\n\nТеперь начнём распаковку личности.\nЯ задам тебе 15 вопросов — отвечай подробно и честно 👇")
+        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[0])
+        return
+
+    # --- BIO по кнопке ---
+    if sess["stage"] == "done_interview" and data == "bio":
+        sess["stage"] = "bio"
+        await generate_bio(cid, sess, ctx)
+        return
+
+    # --- Переход к продукту ---
+    if sess["stage"] in ("done_interview", "done_bio") and data == "product":
+        sess["stage"] = "product_ask"
+        sess["product_answers"] = []
+        await ctx.bot.send_message(chat_id=cid, text="Расскажи о своём продукте/услуге — как для потенциального клиента.")
+        return
+
+    # --- Переход к JTBD ---
+    if sess["stage"] in ("done_interview", "done_bio", "done_product") and data == "jtbd":
+        await start_jtbd(cid, sess, ctx)
+        return
+
+    if data == "jtbd_more" and sess["stage"] == "jtbd_first":
+        await handle_more_jtbd(update, ctx)
+        return
+
+    if data == "jtbd_done" and sess["stage"] == "jtbd_first":
+        await handle_skip_jtbd(update, ctx)
+        return
+
+async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     sess = sessions.get(cid)
     text = update.message.text.strip()
     if not sess:
         return
 
+    # ---------- INTERVIEW FLOW ----------
     if sess["stage"] == "interview":
         sess["answers"].append(text)
+        # Комментарий коуча с защитой от ошибок
         try:
             comment = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
@@ -74,15 +130,18 @@ async def message_handler(update, ctx):
             )
             await ctx.bot.send_message(chat_id=cid, text=comment.choices[0].message.content)
         except Exception as e:
-            await ctx.bot.send_message(chat_id=cid, text="⚠️ Не удалось получить комментарий. Продолжим 👇")
-            print("Ошибка комментария:", e)
+            await ctx.bot.send_message(chat_id=cid, text="⚠️ Не удалось получить комментарий, но мы продолжаем.")
+            print("OpenAI comment error:", e)
 
         idx = len(sess["answers"])
         if idx < len(INTERVIEW_Q):
             await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
         else:
+            # --- Интервью завершено ---
             sess["stage"] = "done_interview"
+
             answers = "\n".join(sess["answers"])
+            # Распаковка
             unpack = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[
@@ -90,54 +149,38 @@ async def message_handler(update, ctx):
                     {"role": "user", "content": answers}
                 ]
             )
-            unpacking_text = unpack.choices[0].message.content
-            sess["unpacking"] = unpacking_text
-            await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:
+            unpack_text = unpack.choices[0].message.content
+            sess["unpacking"] = unpack_text
+            await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack_text)
 
-" + unpacking_text)
-
+            # Позиционирование с расширенным форматированием
             pos = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "На основе распаковки личности сформулируй чёткое позиционирование в следующем формате:
-
-"
-                            "1. Кто ты (1–2 предложения от первого лица)
-"
-                            "**Детализация:**
-"
-                            "2. Направления развития
-"
-                            "3. Ценности
-"
-                            "4. Сильные стороны
-"
-                            "5. Сообщение для аудитории
-"
-                            "6. Цели и стремления
-"
-                            "7. Лозунг
-"
-                            "8. Цель сообщества (если релевантно)
-"
-                            "9. Миссия
-"
-                            "10. Значение идеи
-"
-                            "11. Призыв к действию
-
-"
-                            "Оформляй с подзаголовками и маркированными списками, как в примере. Стиль — вдохновляющий, но конкретный. Без повторов. Формат Markdown."
+                            "На основе распаковки личности сформулируй чёткое позиционирование в следующем формате:\n\n"
+                            "1. Кто ты (1–2 предложения от первого лица)\n"
+                            "**Детализация:**\n"
+                            "2. Направления развития\n"
+                            "3. Ценности\n"
+                            "4. Сильные стороны\n"
+                            "5. Сообщение для аудитории\n"
+                            "6. Цели и стремления\n"
+                            "7. Лозунг\n"
+                            "8. Цель сообщества (при наличии)\n"
+                            "9. Миссия\n"
+                            "10. Значение идеи\n"
+                            "11. Призыв к действию\n\n"
+                            "Оформляй с подзаголовками и маркированными списками. Стиль — вдохновляющий, но конкретный. Формат Markdown."
                         )
                     },
-                    {"role": "user", "content": unpacking_text}
+                    {"role": "user", "content": unpack_text}
                 ]
             )
             positioning_text = pos.choices[0].message.content
-            sess["positioning"] = positioning_text
+            sess["positioning"] = positioning
             await ctx.bot.send_message(chat_id=cid, text=positioning_text)
 
             kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
