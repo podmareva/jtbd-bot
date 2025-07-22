@@ -140,7 +140,7 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # --- Интервью завершено ---
             sess["stage"] = "done_interview"
 
- async def finish_interview(cid, sess, ctx):
+async def finish_interview(cid, sess, ctx):
     answers = "\n".join(sess["answers"])
 
     unpack = openai.ChatCompletion.create(
@@ -185,7 +185,7 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess["stage"] = "done_interview"
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
     await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
-        return
+    return
 
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
