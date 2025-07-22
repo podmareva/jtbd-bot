@@ -140,51 +140,51 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # --- Интервью завершено ---
             sess["stage"] = "done_interview"
 
-            answers = "\n".join(sess["answers"])
-            # Распаковка
-            unpack = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "На основе ответов сделай глубокую распаковку личности: ценности, убеждения, сильные стороны, сообщения для аудитории."},
-                    {"role": "user", "content": answers}
-                ]
-            )
-            unpack_text = unpack.choices[0].message.content
-            sess["unpacking"] = unpack_text
-            await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack_text)
+ async def finish_interview(cid, sess, ctx):
+    answers = "\n".join(sess["answers"])
 
-            # Позиционирование с расширенным форматированием
-            pos = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "На основе распаковки личности сформулируй чёткое позиционирование в следующем формате:\n\n"
-                            "1. Кто ты (1–2 предложения от первого лица)\n"
-                            "**Детализация:**\n"
-                            "2. Направления развития\n"
-                            "3. Ценности\n"
-                            "4. Сильные стороны\n"
-                            "5. Сообщение для аудитории\n"
-                            "6. Цели и стремления\n"
-                            "7. Лозунг\n"
-                            "8. Цель сообщества (при наличии)\n"
-                            "9. Миссия\n"
-                            "10. Значение идеи\n"
-                            "11. Призыв к действию\n\n"
-                            "Оформляй с подзаголовками и маркированными списками. Стиль — вдохновляющий, но конкретный. Формат Markdown."
-                        )
-                    },
-                    {"role": "user", "content": unpack_text}
-                ]
-            )
-            positioning_text = pos.choices[0].message.content
-            sess["positioning"] = positioning
-            await ctx.bot.send_message(chat_id=cid, text=positioning_text)
+    unpack = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "На основе ответов сделай глубокую распаковку личности: ценности, убеждения, сильные стороны, сообщения для аудитории."},
+            {"role": "user", "content": answers}
+        ]
+    )
+    unpack_text = unpack.choices[0].message.content
+    sess["unpacking"] = unpack_text
+    await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack_text)
 
-            kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
-            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+    pos = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "На основе распаковки личности сформулируй чёткое позиционирование в следующем формате:\n\n"
+                    "1. Кто ты (1–2 предложения от первого лица)\n"
+                    "**Детализация:**\n"
+                    "2. Направления развития\n"
+                    "3. Ценности\n"
+                    "4. Сильные стороны\n"
+                    "5. Сообщение для аудитории\n"
+                    "6. Цели и стремления\n"
+                    "7. Лозунг\n"
+                    "8. Цель сообщества (при наличии)\n"
+                    "9. Миссия\n"
+                    "10. Значение идеи\n"
+                    "11. Призыв к действию\n\n"
+                    "Оформляй с подзаголовками и маркированными списками. Стиль — вдохновляющий, но конкретный. Формат Markdown."
+                )
+            },
+            {"role": "user", "content": unpack_text}
+        ]
+    )
+    positioning_text = pos.choices[0].message.content
+    sess["positioning"] = positioning_text
+    await ctx.bot.send_message(chat_id=cid, text="🎯 Позиционирование:\n\n" + positioning_text)
+    sess["stage"] = "done_interview"
+    kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
+    await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if sess["stage"] == "product_ask":
