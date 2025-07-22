@@ -84,7 +84,7 @@ async def message_handler(update, ctx):
             await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
         else:
             sess["stage"] = "done_interview"
-            answers = "
+            answers = "\n".join(sess["answers"])
 ".join(sess["answers"])
             unpack = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
