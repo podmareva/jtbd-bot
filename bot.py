@@ -148,21 +148,24 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             print(f"[INFO] Завершаем интервью для cid {cid}")
             await finish_interview(cid, sess, ctx)
+    return
+    
     if sess["stage"] == "product_ask":
-        sess["product_answers"].append(text)
-        idx = len(sess["product_answers"])
+    sess["product_answers"].append(text)
+    idx = len(sess["product_answers"])
     if idx < len(PRODUCT_Q):
-            await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
-        else:
-            await ctx.bot.send_message(
-                chat_id=cid,
-                text="Спасибо! Все ответы по продукту получены.",
-                reply_markup=InlineKeyboardMarkup([
-                   [InlineKeyboardButton("🔍 Анализ ЦА", callback_data="jtbd")]
-                ])
-            )
-            sess["stage"] = "done_product"
-        return
+        await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
+    else:
+        await ctx.bot.send_message(
+            chat_id=cid,
+            text="Спасибо! Все ответы по продукту получены.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 Анализ ЦА", callback_data="jtbd")]
+            ])
+        )
+        sess["stage"] = "done_product"
+    return
+
 
 
 async def finish_interview(cid, sess, ctx):
