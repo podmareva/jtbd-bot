@@ -141,6 +141,7 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await finish_interview(cid, sess, ctx)
 
 async def finish_interview(cid, sess, ctx):
+    print(f"[INFO] Генерация распаковки для cid {cid}")
     answers = "\n".join(sess["answers"])
 
     unpack = openai.ChatCompletion.create(
@@ -154,6 +155,7 @@ async def finish_interview(cid, sess, ctx):
     sess["unpacking"] = unpack_text
     await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack_text)
 
+    print(f"[INFO] Генерация позиционирования для cid {cid}")
     pos = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -181,7 +183,13 @@ async def finish_interview(cid, sess, ctx):
     )
     positioning_text = pos.choices[0].message.content
     sess["positioning"] = positioning_text
-    await ctx.bot.send_message(chat_id=cid, text="🎯 Позиционирование:\n\n" + positioning_text)
+
+    # Разбиваем позиционирование на два сообщения
+    parts = positioning_text.split('\n\n', 1)
+    await ctx.bot.send_message(chat_id=cid, text="🎯 Позиционирование:\n\n" + parts[0])
+    if len(parts) > 1:
+        await ctx.bot.send_message(chat_id=cid, text=parts[1])
+
     sess["stage"] = "done_interview"
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
     await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
