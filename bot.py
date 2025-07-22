@@ -283,6 +283,7 @@ async def handle_skip_jtbd(update, ctx):
 
 # ---------- MAIN ----------
 def main():
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback_handler))
