@@ -107,45 +107,50 @@ async def message_handler(update, ctx):
         return
 
     if sess["stage"] == "interview":
-        sess["answers"].append(text)
-        # Комментарий к ответу
-        comment = openai.ChatCompletion.create(
+    sess["answers"].append(text)
+    # Комментарий к ответу
+    comment = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Ты — поддерживающий коуч. На «ты». Дай короткий комментарий к ответу — по теме, дружелюбно, без вопросов."},
+            {"role": "user", "content": text}
+        ]
+    )
+    await ctx.bot.send_message(chat_id=cid, text=comment.choices[0].message.content)
+    idx = len(sess["answers"])
+    if idx < len(INTERVIEW_Q):
+        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
+    else:
+        sess["stage"] = "done_interview"
+        # Распаковка
+        answers = "\n".join(sess["answers"])
+        unpack = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "Ты — поддерживающий коуч. На «ты». Дай короткий комментарий к ответу — по теме, дружелюбно, без вопросов."},
-                {"role": "user", "content": text}
+                {"role": "system", "content": "На основе ответов сделай глубокую распаковку личности: ценности, убеждения, сильные стороны, сообщения для аудитории."},
+                {"role": "user", "content": answers}
             ]
         )
-        await ctx.bot.send_message(chat_id=cid, text=comment.choices[0].message.content)
-        idx = len(sess["answers"])
-        if idx < len(INTERVIEW_Q):
-            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
-        else:
-            sess["stage"] = "done_interview"
-            # Распаковка
-            answers = "\n".join(sess["answers"])
-            unpack = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "На основе ответов сделай глубокую распаковку личности: ценности, убеждения, сильные стороны, сообщения для аудитории."},
-                    {"role": "user", "content": answers}
-                ]
-            )
-            await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack.choices[0].message.content)
+        unpacking_text = unpack.choices[0].message.content
+        sess["unpacking"] = unpacking_text
+        await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpacking_text)
 
-            # Позиционирование
-            pos = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "На основе распаковки сделай чёткое позиционирование и его детализацию."},
-                    {"role": "user", "content": unpack.choices[0].message.content}
-                ]
-            )
-            sess["positioning"] = pos.choices[0].message.content
-            await ctx.bot.send_message(chat_id=cid, text=sess["positioning"])
-            kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
-            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
-        return
+        # Позиционирование
+        pos = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "На основе распаковки сделай чёткое позиционирование и его детализацию."},
+                {"role": "user", "content": unpacking_text}
+            ]
+        )
+        positioning_text = pos.choices[0].message.content
+        sess["positioning"] = positioning_text
+        await ctx.bot.send_message(chat_id=cid, text=positioning_text)
+
+        kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
+        await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+    return
+
 
     if sess["stage"] == "product_ask":
         sess["product_answers"].append(text)
