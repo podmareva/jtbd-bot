@@ -85,8 +85,10 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # --- Согласие ---
     if sess["stage"] == "welcome" and data == "agree":
         sess["stage"] = "interview"
-        await ctx.bot.send_message(chat_id=cid,
-                                   text="✅ Спасибо за согласие!\n\nТеперь начнём распаковку личности.\nЯ задам тебе 15 вопросов — отвечай подробно и честно 👇")
+        await ctx.bot.send_message(
+            chat_id=cid,
+            text="✅ Спасибо за согласие!\n\nТеперь начнём распаковку личности.\nЯ задам тебе 15 вопросов — отвечай подробно и честно 👇"
+        )
         await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[0])
         return
 
@@ -100,7 +102,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sess["stage"] in ("done_interview", "done_bio") and data == "product":
         sess["stage"] = "product_ask"
         sess["product_answers"] = []
-        await ctx.bot.send_message(chat_id=cid, text="Расскажи о своём продукте/услуге — как для потенциального клиента.")
+        await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[0])
         return
 
     # --- Переход к JTBD ---
@@ -123,8 +125,6 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not sess:
         return
 
-    idx = None  # <--- добавь эту строку
-
     # ---------- INTERVIEW FLOW ----------
     if sess["stage"] == "interview":
         sess["answers"].append(text)
@@ -142,79 +142,79 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             print("OpenAI comment error:", e)
 
         idx = len(sess["answers"])
-
         if idx < len(INTERVIEW_Q):
             await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
         else:
             print(f"[INFO] Завершаем интервью для cid {cid}")
             await finish_interview(cid, sess, ctx)
-    return
-    
+        return
+
+    # ---------- PRODUCT FLOW ----------
     if sess["stage"] == "product_ask":
-    sess["product_answers"].append(text)
-    idx = len(sess["product_answers"])
-    if idx < len(PRODUCT_Q):
-        await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
-    else:
-        await ctx.bot.send_message(
-            chat_id=cid,
-            text="Спасибо! Все ответы по продукту получены.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Анализ ЦА", callback_data="jtbd")]
-            ])
-        )
-        sess["stage"] = "done_product"
-    return
+        sess["product_answers"].append(text)
+        idx = len(sess["product_answers"])
+        if idx < len(PRODUCT_Q):
+            await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
+        else:
+            await ctx.bot.send_message(
+                chat_id=cid,
+                text="Спасибо! Все ответы по продукту получены.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔍 Анализ ЦА", callback_data="jtbd")]
+                ])
+            )
+            sess["stage"] = "done_product"
+        return
 
-
+    # Тут идут другие этапы, если есть
 
 async def finish_interview(cid, sess, ctx):
     print(f"[INFO] Генерация распаковки для cid {cid}")
     answers = "\n".join(sess["answers"])
 
     unpack = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {
-            "role": "system",
-            "content": (
-                "Ты профессиональный коуч и бренд-стратег. На основе ответов проведи глубокую, подробную распаковку личности: "
-                "раскрой ценности, жизненные и профессиональные убеждения, сильные стороны, уникальные черты, мотивы, личную историю, "
-                "цели, миссию, послание для аудитории, триггеры, раскрывающие потенциал. Пиши на русском языке, с деталями и живыми примерами, "
-                "разбивая по логическим блокам с подзаголовками. Формат — Markdown."
-            )
-        },
-        {"role": "user", "content": answers}
-    ]
-)
+        model="gpt-3.5-turbo",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты профессиональный коуч и бренд-стратег. На основе ответов проведи глубокую, подробную распаковку личности: "
+                    "раскрой ценности, жизненные и профессиональные убеждения, сильные стороны, уникальные черты, мотивы, личную историю, "
+                    "цели, миссию, послание для аудитории, триггеры, раскрывающие потенциал. Пиши на русском языке, с деталями и живыми примерами, "
+                    "разбивая по логическим блокам с подзаголовками. Формат — Markdown."
+                )
+            },
+            {"role": "user", "content": answers}
+        ]
+    )
     unpack_text = unpack.choices[0].message.content
     sess["unpacking"] = unpack_text
     await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack_text)
 
     print(f"[INFO] Генерация позиционирования для cid {cid}")
     pos = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {
-            "role": "system",
-            "content": (
-                "Ты бренд-стратег. На основе распаковки личности подробно сформулируй позиционирование на русском языке "
-                "в развернутом виде — от лица человека (1–2 абзаца о себе), затем детализируй: "
-                "— основные направления развития\n"
-                "— ключевые ценности\n"
-                "— сильные стороны\n"
-                "— послание для аудитории\n"
-                "— миссия\n"
-                "— слоган (1 фраза)\n"
-                "— цель сообщества (если есть)\n"
-                "— уникальность и отличия\n"
-                "— итоговый призыв к действию\n\n"
-                "Сначала дай общий абзац о человеке, затем — остальные пункты с подзаголовками и списками. Всё на русском, стильно и вдохновляюще. Формат Markdown."
-            )
-        },
-        {"role": "user", "content": unpack_text}
-    ]
-)
+        model="gpt-3.5-turbo",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты бренд-стратег. На основе распаковки личности подробно сформулируй позиционирование на русском языке "
+                    "в развернутом виде — от лица человека (1–2 абзаца о себе), затем детализируй: "
+                    "— основные направления развития\n"
+                    "— ключевые ценности\n"
+                    "— сильные стороны\n"
+                    "— послание для аудитории\n"
+                    "— миссия\n"
+                    "— слоган (1 фраза)\n"
+                    "— цель сообщества (если есть)\n"
+                    "— уникальность и отличия\n"
+                    "— итоговый призыв к действию\n\n"
+                    "Сначала дай общий абзац о человеке, затем — остальные пункты с подзаголовками и списками. Всё на русском, стильно и вдохновляюще. Формат Markdown."
+                )
+            },
+            {"role": "user", "content": unpack_text}
+        ]
+    )
     positioning_text = pos.choices[0].message.content
     sess["positioning"] = positioning_text
 
@@ -264,14 +264,18 @@ async def start_jtbd(cid, sess, ctx):
         "- Триггеры\n- Барьеры\n- Альтернативы\n\n"
         "Исходная информация:\n" + ctx_text
     )
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo",
-                                        messages=[{"role": "user", "content": prompt}])
-    await ctx.bot.send_message(chat_id=cid,
-                               text="🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content,
-                               reply_markup=InlineKeyboardMarkup([
-                                   [InlineKeyboardButton("Хочу дополнительные сегменты", callback_data="jtbd_more")],
-                                   [InlineKeyboardButton("Хватит, благодарю", callback_data="jtbd_done")]
-                               ]))
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text="🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Хочу дополнительные сегменты", callback_data="jtbd_more")],
+            [InlineKeyboardButton("Хватит, благодарю", callback_data="jtbd_done")]
+        ])
+    )
     sess["stage"] = "jtbd_first"
 
 async def handle_more_jtbd(update, ctx):
@@ -282,10 +286,14 @@ async def handle_more_jtbd(update, ctx):
         "Добавь ещё 3 неочевидных сегмента ЦА по JTBD в том же формате также на основании распаковки, позиционирования и продукта. "
         "(Job, потребности, боли, триггеры, барьеры, альтернативы):\n\n" + ctx_text
     )
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo",
-                                        messages=[{"role": "user", "content": prompt}])
-    await ctx.bot.send_message(chat_id=cid,
-                               text="🔍 Дополнительные сегменты:\n\n" + resp.choices[0].message.content)
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text="🔍 Дополнительные сегменты:\n\n" + resp.choices[0].message.content
+    )
     await ctx.bot.send_message(
         chat_id=cid,
         text="✅ Распаковка и анализ ЦА завершены — теперь у тебя есть фундамент для позиционирования, упаковки и коммуникации.\n\n"
