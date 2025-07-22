@@ -134,11 +134,11 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             print("OpenAI comment error:", e)
 
         idx = len(sess["answers"])
-        if idx < len(INTERVIEW_Q):
-            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
-        else:
-            # --- Интервью завершено ---
-            sess["stage"] = "done_interview"
+    if idx < len(INTERVIEW_Q):
+        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
+    else:
+        print(f"[INFO] Завершаем интервью для cid {cid}")
+        await finish_interview(cid, sess, ctx)
 
 async def finish_interview(cid, sess, ctx):
     answers = "\n".join(sess["answers"])
