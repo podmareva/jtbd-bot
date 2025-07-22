@@ -151,13 +151,19 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sess["stage"] == "product_ask":
         sess["product_answers"].append(text)
         idx = len(sess["product_answers"])
-        if idx < len(PRODUCT_Q):
+    if idx < len(PRODUCT_Q):
             await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
         else:
-            await ctx.bot.send_message(chat_id=cid, text="Спасибо! Все ответы по продукту получены.")
-            # Здесь можно переходить к анализу ЦА или выводить следующее меню:
-            await start_jtbd(cid, sess, ctx)
+            await ctx.bot.send_message(
+                chat_id=cid,
+                text="Спасибо! Все ответы по продукту получены.",
+                reply_markup=InlineKeyboardMarkup([
+                   [InlineKeyboardButton("🔍 Анализ ЦА", callback_data="jtbd")]
+                ])
+            )
+            sess["stage"] = "done_product"
         return
+
 
 async def finish_interview(cid, sess, ctx):
     print(f"[INFO] Генерация распаковки для cid {cid}")
@@ -223,9 +229,10 @@ async def finish_interview(cid, sess, ctx):
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
     prompt = (
-        "На основе позиционирования сформулируй 5 кратких BIO для Instagram на русском языке. "
-        "Каждое BIO — 3–4 тезиса, максимум 180 символов (включая пробелы). "
-        "Стиль яркий, цепляющий, без списков:\n\n"
+        "На основе позиционирования сгенерируй 5 вариантов короткого BIO для шапки профиля Instagram на русском языке. "
+        "Каждый вариант — 2–3 цепляющих, лаконичных фразы подряд, разделённых слэшами («/»), без списков, без заголовков и пояснений, не более 180 символов. "
+        "Варианты пиши только текстом, без оформления Markdown и без номеров. Формулировки — живые, в стиле Instagram: вызывай интерес, добавь call-to-action или эмоцию."
+        "\n\n"
         + sess["positioning"]
     )
     resp = openai.ChatCompletion.create(
