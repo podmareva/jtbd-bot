@@ -29,8 +29,8 @@ WELCOME = (
     "• подробно разобрать продукт/услугу;\n"
     "• провести анализ ЦА по JTBD.\n\n"
     "🔐 Чтобы начать, подтверди согласие с "
-    "[Политикой конфиденциальности](https://docs.google.com/…) и "
-    "[Договором‑офертой](https://docs.google.com/…).\n\n"
+    "[Политикой конфиденциальности](https://docs.google.com/document/d/1UUyKq7aCbtrOT81VBVwgsOipjtWpro7v/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true) и "
+    "[Договором‑офертой](https://docs.google.com/document/d/1zY2hl0ykUyDYGQbSygmcgY2JaVMMZjQL/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true).\n\n"
     "✅ Нажми «СОГЛАСЕН/СОГЛАСНА» — и поехали!"
 )
 
@@ -116,10 +116,11 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not sess:
         return
 
+    idx = None  # <--- добавь эту строку
+
     # ---------- INTERVIEW FLOW ----------
     if sess["stage"] == "interview":
         sess["answers"].append(text)
-        # Комментарий коуча с защитой от ошибок
         try:
             comment = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
@@ -134,11 +135,12 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             print("OpenAI comment error:", e)
 
         idx = len(sess["answers"])
-    if idx < len(INTERVIEW_Q):
-        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
-    else:
-        print(f"[INFO] Завершаем интервью для cid {cid}")
-        await finish_interview(cid, sess, ctx)
+
+        if idx < len(INTERVIEW_Q):
+            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
+        else:
+            print(f"[INFO] Завершаем интервью для cid {cid}")
+            await finish_interview(cid, sess, ctx)
 
 async def finish_interview(cid, sess, ctx):
     print(f"[INFO] Генерация распаковки для cid {cid}")
