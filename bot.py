@@ -105,8 +105,8 @@ async def message_handler(update, ctx):
     text = update.message.text.strip()
     if not sess:
         return
-
-        if sess["stage"] == "interview":
+        
+    if sess["stage"] == "interview":
         sess["answers"].append(text)
         # Комментарий к ответу
         comment = openai.ChatCompletion.create(
