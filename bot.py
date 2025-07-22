@@ -187,28 +187,6 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if sess["stage"] == "product_ask":
-        sess["product_answers"].append(text)
-        if len(sess["product_answers"]) < 3:
-            prompts = [
-                "А теперь расскажи, какую проблему решает этот продукт?",
-                "И для кого он предназначен?"
-            ]
-            await ctx.bot.send_message(chat_id=cid, text=prompts[len(sess["product_answers"]) - 1])
-        else:
-            joined = "\n".join(sess["product_answers"])
-            resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "user", "content": "Проанализируй этот продукт/услугу и сформулируй его ценность, сильные стороны и рекомендации по продвижению:\n" + joined}
-                ]
-            )
-            await ctx.bot.send_message(chat_id=cid, text="🔎 Анализ продукта:\n\n" + resp.choices[0].message.content)
-            sess["stage"] = "done_product"
-            kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU if c != "product"]
-            await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
     prompt = (
