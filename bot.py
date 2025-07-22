@@ -198,18 +198,25 @@ async def finish_interview(cid, sess, ctx):
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
     prompt = (
-        "На основе позиционирования сформулируй 5 вариантов BIO для Instagram. "
-        "Каждый вариант — 3–4 цепляющих тезиса, суммарно до 180 символов:\n\n"
+        "На основе позиционирования сформулируй 5 кратких BIO для Instagram. "
+        "Каждое BIO — 3–4 тезиса, максимум 180 символов (включая пробелы). Стиль яркий, цепляющий, без списков:\n\n"
         + sess["positioning"]
     )
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}]
     )
-    await ctx.bot.send_message(chat_id=cid, text="📱 Варианты BIO:\n\n" + resp.choices[0].message.content)
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text="📱 Варианты BIO:\n\n" + resp.choices[0].message.content
+    )
     sess["stage"] = "done_bio"
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU if c != "bio"]
-    await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text="Что дальше?",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 # ---------- JTBD ----------
 async def start_jtbd(cid, sess, ctx):
@@ -283,7 +290,6 @@ async def handle_skip_jtbd(update, ctx):
 
 # ---------- MAIN ----------
 def main():
-    app.add_handler(CallbackQueryHandler(callback_handler))
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback_handler))
