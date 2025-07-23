@@ -7,6 +7,7 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
 import openai
+print(">>> Бот загружен, файл bot.py исполняется")
 
 # ---------- НАСТРОЙКИ ----------
 
