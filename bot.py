@@ -68,6 +68,7 @@ MAIN_MENU = [
 # ---------- HANDLERS ----------
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    print(">>> Функция /start вызвана")
     cid = update.effective_chat.id
     sessions[cid] = {"stage": "welcome", "answers": [], "product_answers": []}
     kb = [[InlineKeyboardButton("✅ СОГЛАСЕН/СОГЛАСНА", callback_data="agree")]]
