@@ -156,6 +156,9 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if idx < len(PRODUCT_Q):
             await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
         else:
+            # Сначала анализ продукта
+            await generate_product_analysis(cid, sess, ctx)
+            # Потом сообщение и кнопка Анализ ЦА
             await ctx.bot.send_message(
                 chat_id=cid,
                 text="Спасибо! Все ответы по продукту получены.",
@@ -254,6 +257,23 @@ async def generate_bio(cid, sess, ctx):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
+# ---------- PRODUCT ANALYSIS ----------
+async def generate_product_analysis(cid, sess, ctx):
+    prompt = (
+        "На основе ответов пользователя на вопросы о продукте, напиши краткий анализ продукта для Telegram в 3–5 предложениях. "
+        "Раскрой суть продукта, ключевые выгоды, отличия от конкурентов, результат для клиента. Язык — русский, стиль деловой, но понятный."
+        "\n\n"
+        + "\n".join(sess["product_answers"])
+    )
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text="📝 Краткий анализ продукта:\n\n" + resp.choices[0].message.content
+    )
+
 # ---------- JTBD ----------
 async def start_jtbd(cid, sess, ctx):
     ctx_text = "\n".join(sess["answers"] + sess["product_answers"])
@@ -344,4 +364,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    main
