@@ -1,5 +1,7 @@
 import os
 import sys
+import sqlite3
+import secrets
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -7,22 +9,52 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
 import openai
-print(">>> Бот загружен, файл bot.py исполняется")
 
 # ---------- НАСТРОЙКИ ----------
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "MainBotName")  # указать в .env
 
-# Защита от двойного запуска
-if "RUNNING_BOT" in os.environ:
-    print("❌ Бот уже запущен. Останови другой процесс, чтобы избежать конфликта.")
-    sys.exit(1)
-os.environ["RUNNING_BOT"] = "1"
+# ---------- SQLite: ДОСТУП ЧЕРЕЗ ТОКЕН ----------
 
-sessions = {}
+DB_PATH = "tokens.db"
 
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS tokens (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            used INTEGER DEFAULT 0
+        )
+        """)
+init_db()
+
+def create_token(user_id):
+    token = secrets.token_urlsafe(8)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO tokens (token, user_id, used) VALUES (?, ?, 0)", (token, user_id))
+    return token
+
+def validate_token(token, user_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        res = conn.execute(
+            "SELECT used, user_id FROM tokens WHERE token = ?", (token,)
+        ).fetchone()
+        if not res:
+            return False, "Неверный токен."
+        used, db_uid = res
+        if used:
+            return False, "Токен уже использован."
+        if db_uid != user_id:
+            return False, "Нет доступа. Этот токен для другого пользователя."
+        conn.execute("UPDATE tokens SET used = 1 WHERE token = ?", (token,))
+        return True, None
+
+# ---------- ДАННЫЕ ----------
 WELCOME = (
     "👋 Привет! Ты в боте «Твоя распаковка и анализ ЦА» — он поможет:\n"
     "• распаковать твою экспертную личность;\n"
@@ -66,14 +98,58 @@ MAIN_MENU = [
     ("🔍 Анализ ЦА", "jtbd")
 ]
 
+sessions = {}
+
 # ---------- HANDLERS ----------
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    print(">>> Функция /start вызвана")
     cid = update.effective_chat.id
-    sessions[cid] = {"stage": "welcome", "answers": [], "product_answers": []}
+    user_id = update.effective_user.id
+
+    # --- Доступ по токену ---
+    args = ctx.args if hasattr(ctx, "args") else []
+    if args:
+        token = args[0]
+        valid, reason = validate_token(token, user_id)
+        if not valid:
+            await ctx.bot.send_message(chat_id=cid, text=f"⛔️ {reason}")
+            return
+    else:
+        if user_id != ADMIN_ID:
+            await ctx.bot.send_message(chat_id=cid, text="⛔️ Нет доступа. Получи персональную ссылку у администратора.")
+            return
+
+    sessions[cid] = {
+        "stage": "welcome",
+        "answers": [],
+        "product_answers": [],
+        "products": []
+    }
     kb = [[InlineKeyboardButton("✅ СОГЛАСЕН/СОГЛАСНА", callback_data="agree")]]
     await ctx.bot.send_message(chat_id=cid, text=WELCOME, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def gentoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if user_id != ADMIN_ID:
+        await ctx.bot.send_message(chat_id=cid, text="⛔️ Только для администратора.")
+        return
+
+    if not ctx.args or not ctx.args[0].isdigit():
+        await ctx.bot.send_message(chat_id=cid, text="Используй: /gentoken user_id (числовой Telegram ID)")
+        return
+
+    target_id = int(ctx.args[0])
+    token = create_token(target_id)
+    link = f"https://t.me/{MAIN_BOT_USERNAME}?start={token}"
+
+    await ctx.bot.send_message(
+        chat_id=cid,
+        text=f"✅ Токен сгенерирован: <code>{token}</code>\n"
+             f"🔗 Ссылка для пользователя:\n{link}",
+        parse_mode="HTML"
+    )
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
@@ -107,16 +183,41 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[0])
         return
 
+    # --- Следующий продукт (мультипродукт!) ---
+    if sess["stage"] == "product_finished" and data == "add_product":
+        sess["stage"] = "product_ask"
+        sess["product_answers"] = []
+        await ctx.bot.send_message(chat_id=cid, text="Окей! Расскажи о новом продукте 👇\n" + PRODUCT_Q[0])
+        return
+
+    if sess["stage"] == "product_finished" and data == "finish_products":
+        await ctx.bot.send_message(chat_id=cid, text="Переходим к анализу ЦА...")
+        await start_jtbd(cid, sess, ctx)
+        return
+
     # --- Переход к JTBD ---
     if sess["stage"] in ("done_interview", "done_bio", "done_product") and data == "jtbd":
         await start_jtbd(cid, sess, ctx)
         return
 
-    if data == "jtbd_more" and sess["stage"] == "jtbd_first":
+    # JTBD ещё раз или завершить
+    if sess["stage"] == "jtbd_done" and data == "jtbd_again":
+        await start_jtbd(cid, sess, ctx)
+        return
+    if sess["stage"] == "jtbd_done" and data == "finish_unpack":
+        await ctx.bot.send_message(
+            chat_id=cid,
+            text="✅ Распаковка завершена!\n\n"
+                 "Спасибо за работу! Теперь ты можешь использовать Контент-ассистента для стратегий и идей. "
+                 "Если нужна помощь — пиши!"
+        )
+        return
+
+    if data == "jtbd_more" and sess.get("stage") == "jtbd_first":
         await handle_more_jtbd(update, ctx)
         return
 
-    if data == "jtbd_done" and sess["stage"] == "jtbd_first":
+    if data == "jtbd_done" and sess.get("stage") == "jtbd_first":
         await handle_skip_jtbd(update, ctx)
         return
 
@@ -151,32 +252,38 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await finish_interview(cid, sess, ctx)
         return
 
-    # ---------- PRODUCT FLOW ----------
+    # ---------- PRODUCT FLOW с мультипродуктом ----------
     if sess["stage"] == "product_ask":
         sess["product_answers"].append(text)
         idx = len(sess["product_answers"])
         if idx < len(PRODUCT_Q):
             await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
         else:
-            # Сначала анализ продукта
+            # Сохраняем продукт (все его ответы)
+            sess.setdefault("products", []).append(sess["product_answers"].copy())
             await generate_product_analysis(cid, sess, ctx)
-            # Потом сообщение и кнопка Анализ ЦА
+            # Спрашиваем: есть ли ещё продукты?
+            kb = [
+                [InlineKeyboardButton("Добавить ещё продукт", callback_data="add_product")],
+                [InlineKeyboardButton("Перейти к анализу ЦА", callback_data="finish_products")]
+            ]
             await ctx.bot.send_message(
                 chat_id=cid,
-                text="Спасибо! Все ответы по продукту получены.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔍 Анализ ЦА", callback_data="jtbd")]
-                ])
+                text="Спасибо! Все ответы по продукту получены.\nХочешь рассказать ещё об одном продукте?",
+                reply_markup=InlineKeyboardMarkup(kb)
             )
-            sess["stage"] = "done_product"
+            sess["stage"] = "product_finished"
         return
 
-    # Тут идут другие этапы, если есть
+    # Здесь идут другие этапы, если есть
 
 async def finish_interview(cid, sess, ctx):
     print(f"[INFO] Генерация распаковки для cid {cid}")
     answers = "\n".join(sess["answers"])
-
+    style_note = (
+        "\n\nОбрати внимание: используй стиль, лексику, энергетику и выражения, которые пользователь использовал в своих ответах. "
+        "Пиши в его манере — не переусложняй, не добавляй шаблонные фразы, старайся повторять тональность."
+    )
     unpack = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -187,6 +294,7 @@ async def finish_interview(cid, sess, ctx):
                     "раскрой ценности, жизненные и профессиональные убеждения, сильные стороны, уникальные черты, мотивы, личную историю, "
                     "цели, миссию, послание для аудитории, триггеры, раскрывающие потенциал. Пиши на русском языке, с деталями и живыми примерами, "
                     "разбивая по логическим блокам с подзаголовками. Формат — Markdown."
+                    + style_note
                 )
             },
             {"role": "user", "content": answers}
@@ -194,7 +302,7 @@ async def finish_interview(cid, sess, ctx):
     )
     unpack_text = unpack.choices[0].message.content
     sess["unpacking"] = unpack_text
-    await ctx.bot.send_message(chat_id=cid, text="✅ Твоя распаковка:\n\n" + unpack_text)
+    await send_long_message(ctx, cid, "✅ Твоя распаковка:\n\n" + unpack_text)
 
     print(f"[INFO] Генерация позиционирования для cid {cid}")
     pos = openai.ChatCompletion.create(
@@ -215,6 +323,7 @@ async def finish_interview(cid, sess, ctx):
                     "— уникальность и отличия\n"
                     "— итоговый призыв к действию\n\n"
                     "Сначала дай общий абзац о человеке, затем — остальные пункты с подзаголовками и списками. Всё на русском, стильно и вдохновляюще. Формат Markdown."
+                    + style_note
                 )
             },
             {"role": "user", "content": unpack_text}
@@ -223,11 +332,8 @@ async def finish_interview(cid, sess, ctx):
     positioning_text = pos.choices[0].message.content
     sess["positioning"] = positioning_text
 
-    # Разбиваем позиционирование на два сообщения
-    parts = positioning_text.split('\n\n', 1)
-    await ctx.bot.send_message(chat_id=cid, text="🎯 Позиционирование:\n\n" + parts[0])
-    if len(parts) > 1:
-        await ctx.bot.send_message(chat_id=cid, text=parts[1])
+    # Разбиваем позиционирование на 2+ сообщений, если очень длинно
+    await send_long_message(ctx, cid, "🎯 Позиционирование:\n\n" + positioning_text)
 
     sess["stage"] = "done_interview"
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
@@ -236,11 +342,15 @@ async def finish_interview(cid, sess, ctx):
 
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
+    style_note = (
+        "\n\nОбрати внимание: используй стиль и лексику пользователя, пиши фразы в его манере."
+    )
     prompt = (
         "На основе позиционирования сгенерируй 5 вариантов короткого BIO для шапки профиля Instagram на русском языке. "
         "Каждый вариант — 2–3 цепляющих, лаконичных фразы подряд, разделённых слэшами («/»), без списков, без заголовков и пояснений, не более 180 символов. "
         "Варианты пиши только текстом, без оформления Markdown и без номеров. Формулировки — живые, в стиле Instagram: вызывай интерес, добавь call-to-action или эмоцию."
-        "\n\n"
+        + style_note
+        + "\n\n"
         + sess["positioning"]
     )
     resp = openai.ChatCompletion.create(
@@ -259,13 +369,18 @@ async def generate_bio(cid, sess, ctx):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-# ---------- PRODUCT ANALYSIS ----------
+# ---------- КРАТКИЙ АНАЛИЗ ПРОДУКТА (учёт стиля пользователя) ----------
 async def generate_product_analysis(cid, sess, ctx):
+    style_note = (
+        "\n\nСохраняй стиль, лексику и тональность пользователя (ориентируйся на его оригинальные формулировки)."
+    )
+    answers = "\n".join(sess["product_answers"])
     prompt = (
         "На основе ответов пользователя на вопросы о продукте, напиши краткий анализ продукта для Telegram в 3–5 предложениях. "
         "Раскрой суть продукта, ключевые выгоды, отличия от конкурентов, результат для клиента. Язык — русский, стиль деловой, но понятный."
-        "\n\n"
-        + "\n".join(sess["product_answers"])
+        + style_note
+        + "\n\n"
+        + answers
     )
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
@@ -276,23 +391,40 @@ async def generate_product_analysis(cid, sess, ctx):
         text="📝 Краткий анализ продукта:\n\n" + resp.choices[0].message.content
     )
 
-# ---------- JTBD ----------
+# ---------- ДЛИННОСООБЩЕНИЯ ----------
+async def send_long_message(ctx, cid, text):
+    MAX_LEN = 4000
+    for i in range(0, len(text), MAX_LEN):
+        await ctx.bot.send_message(chat_id=cid, text=text[i:i+MAX_LEN])
+
+# ---------- JTBD (5 сегментов, учёт всех продуктов, стиль пользователя) ----------
 async def start_jtbd(cid, sess, ctx):
-    ctx_text = "\n".join(sess["answers"] + sess["product_answers"])
+    all_products = []
+    for prod in sess.get("products", []):
+        all_products.append("\n".join(prod))
+    ctx_text = "\n".join(sess["answers"]) + "\n" + "\n\n".join(all_products)
+    style_note = (
+        "\n\nОбрати внимание: используй стиль, лексику, манеру и тональность пользователя (ориентируйся на его формулировки)."
+    )
     prompt = (
-        "Сформулируй 3–4 основных сегмента ЦА по методу JTBD на основании распаковки, позиционирования и продукта. "
+        "Сформулируй 5 основных сегментов ЦА по методу JTBD на основании распаковки, позиционирования и всех продуктов. "
         "Для каждого сегмента укажи:\n"
         "- Job‑to‑be‑done\n- Неочевидные потребности\n- Неочевидные боли\n"
         "- Триггеры\n- Барьеры\n- Альтернативы\n\n"
+        "Дай подробное, развёрнутое описание для каждого сегмента (отдельным блоком)."
+        + style_note
+        + "\n\n"
         "Исходная информация:\n" + ctx_text
     )
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}]
     )
+    await send_long_message(ctx, cid, "🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content)
+    # Кнопка для доп. сегментов
     await ctx.bot.send_message(
         chat_id=cid,
-        text="🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content,
+        text="Хочешь увидеть неочевидные сегменты ЦА?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Хочу дополнительные сегменты", callback_data="jtbd_more")],
             [InlineKeyboardButton("Хватит, благодарю", callback_data="jtbd_done")]
@@ -303,37 +435,35 @@ async def start_jtbd(cid, sess, ctx):
 async def handle_more_jtbd(update, ctx):
     cid = update.effective_chat.id
     sess = sessions.get(cid)
-    ctx_text = "\n".join(sess["answers"] + sess["product_answers"])
+    all_products = []
+    for prod in sess.get("products", []):
+        all_products.append("\n".join(prod))
+    ctx_text = "\n".join(sess["answers"]) + "\n" + "\n\n".join(all_products)
+    style_note = (
+        "\n\nПиши в стиле, лексике и манере пользователя, как в предыдущих ответах!"
+    )
     prompt = (
-        "Добавь ещё 3 неочевидных сегмента ЦА по JTBD в том же формате также на основании распаковки, позиционирования и продукта. "
-        "(Job, потребности, боли, триггеры, барьеры, альтернативы):\n\n" + ctx_text
+        "Добавь ещё 3 неочевидных сегмента ЦА по JTBD в том же развернутом формате также на основании распаковки, позиционирования и всех продуктов. "
+        "Для каждого сегмента опиши подробно: Job, потребности, боли, триггеры, барьеры, альтернативы."
+        + style_note
+        + "\n\n"
+        "Исходная информация:\n" + ctx_text
     )
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}]
     )
+    await send_long_message(ctx, cid, "🔍 Дополнительные неочевидные сегменты:\n\n" + resp.choices[0].message.content)
+    # Кнопки завершить или анализировать ЦА снова
     await ctx.bot.send_message(
         chat_id=cid,
-        text="🔍 Дополнительные сегменты:\n\n" + resp.choices[0].message.content
-    )
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text="✅ Распаковка и анализ ЦА завершены — теперь у тебя есть фундамент для позиционирования, упаковки и коммуникации.\n\n"
-             "Следующий шаг — системная и креативная работа с контентом.\n"
-             "У меня как раз есть компаньон: *Контент-ассистент* 🤖\n\n"
-             "Он поможет:\n"
-             "• создать стратегию под любую соцсеть\n"
-             "• сформировать рубрики и контент-план\n"
-             "• написать посты, сторис и даже сценарии видео\n\n"
-             "Хочешь подключить его прямо сейчас?",
-        parse_mode="Markdown",
+        text="Что дальше?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🪄 Получить доступ", callback_data="get_access")],
-            [InlineKeyboardButton("✅ Уже в арсенале", callback_data="have")],
-            [InlineKeyboardButton("⏳ Обращусь позже", callback_data="later")]
+            [InlineKeyboardButton("Проанализировать ЦА ещё раз", callback_data="jtbd_again")],
+            [InlineKeyboardButton("Завершить распаковку", callback_data="finish_unpack")]
         ])
     )
-    sess["stage"] = "done_jtbd"
+    sess["stage"] = "jtbd_done"
 
 async def handle_skip_jtbd(update, ctx):
     cid = update.effective_chat.id
@@ -358,9 +488,9 @@ async def handle_skip_jtbd(update, ctx):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("gentoken", gentoken))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    # Доп. обработчики JTBD‑кнопок
     app.add_handler(CallbackQueryHandler(handle_more_jtbd, pattern="jtbd_more"))
     app.add_handler(CallbackQueryHandler(handle_skip_jtbd, pattern="jtbd_done"))
     app.run_polling()
