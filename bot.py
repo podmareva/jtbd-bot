@@ -1,569 +1,585 @@
-import os
-from datetime import datetime
-import secrets
+import os, json, secrets, logging
+from datetime import datetime, timedelta
+from typing import Optional
+from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
-    CallbackQueryHandler, MessageHandler, filters, ContextTypes
-)
-
-# если используешь openai — оставь
-import openai
-
-# БД (psycopg v3)
 import psycopg
 from psycopg.rows import dict_row
+from dotenv import load_dotenv
 
-# ------------------ ENV ------------------
-load_dotenv()
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID    = int(os.getenv("ADMIN_ID", "0"))
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("cashier")
 
-# username бота-распаковщика (без @)
-BOT_NAME = os.getenv("MAIN_BOT_USERNAME", "jtbd_assistant_bot")
-
-# ------------------ DB runner (без глобального соединения) ------------------
-def db_run(sql: str, args: tuple = (), fetch: str | None = None):
+async def safe_edit(q, text: str, **kwargs):
     """
-    Выполнить SQL с новым подключением и 1 ретраем.
-    fetch=None -> execute
-    fetch='one' -> fetchone()
-    fetch='all' -> fetchall()
+    Универсальное редактирование: если сообщение медиа — меняем caption,
+    если обычное — меняем text.
     """
     try:
-        with psycopg.connect(
-            DATABASE_URL,
-            sslmode="require",
-            autocommit=True,
-            row_factory=dict_row,
-            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
-        ) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, args)
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
-                return None
-    except psycopg.OperationalError:
-        with psycopg.connect(
-            DATABASE_URL,
-            sslmode="require",
-            autocommit=True,
-            row_factory=dict_row,
-            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
-        ) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, args)
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
-                return None
+        m = q.message
+        if getattr(m, "photo", None) or getattr(m, "document", None) or getattr(m, "video", None) or getattr(m, "video_note", None):
+            return await q.edit_message_caption(caption=text, **kwargs)
+        return await q.edit_message_text(text, **kwargs)
+    except Exception:
+        # fallback на альтернативный метод + лог
+        try:
+            return await q.edit_message_caption(caption=text, **kwargs)
+        except Exception:
+            log.exception("safe_edit: both edit_message_text and edit_message_caption failed")
+            return await q.edit_message_text(text, **kwargs)
 
-# ------------------ Схема БД ------------------
-db_run("""CREATE TABLE IF NOT EXISTS tokens(
+# -------------------- CONFIG / ENV --------------------
+load_dotenv()
+
+BOT_TOKEN    = os.getenv("CASHIER_BOT_TOKEN")
+ADMIN_ID     = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# целевые боты (username)
+BOT_UNPACK = os.getenv("BOT_UNPACK", "jtbd_assistant_bot")              # Бот №1
+BOT_COPY   = os.getenv("BOT_COPY",   "content_helper_assist_bot")       # Бот №2
+
+# юр-документы + инфо о разработчике (ссылки)
+POLICY_URL      = (os.getenv("POLICY_URL") or "").strip()
+OFFER_URL       = (os.getenv("OFFER_URL") or "").strip()
+ADS_CONSENT_URL = (os.getenv("ADS_CONSENT_URL") or "").strip()
+DEV_INFO_URL    = (os.getenv("DEV_INFO_URL") or "").strip()
+
+# кружок (video note) — file_id (опционально)
+DEV_VIDEO_NOTE_ID = os.getenv("DEV_VIDEO_NOTE_ID", "").strip()
+
+# оплата на карту
+PAY_PHONE   = os.getenv("PAY_PHONE", "+7XXXXXXXXXX")
+PAY_NAME    = os.getenv("PAY_NAME", "Ирина Александровна П.")
+PAY_BANK    = os.getenv("PAY_BANK", "ОЗОН-Банк")
+
+# срок жизни персональных ссылок (часы)
+TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "48"))
+
+# примеры ответов (file_id картинок)
+EXAMPLE_IDS = [
+    os.getenv("EXAMPLE_1_ID"),
+    os.getenv("EXAMPLE_2_ID"),
+    os.getenv("EXAMPLE_3_ID"),
+    os.getenv("EXAMPLE_4_ID"),
+    os.getenv("EXAMPLE_5_ID"),
+]
+
+# Акция (только 2 бота)
+PROMO_ACTIVE = os.getenv("PROMO_ACTIVE", "true").lower() == "true"
+PROMO_PRICES = {
+    "unpack": 1890.00,   # Бот №1
+    "copy":   2490.00,   # Бот №2
+    "b12":    3990.00,   # Пакет 1+2
+}
+
+# Конец акции и TZ для напоминаний
+PROMO_END_ISO = os.getenv("PROMO_END_ISO", "").strip()  # напр. 2025-08-18T00:00:00+03:00
+TIMEZONE      = os.getenv("TIMEZONE", "Europe/Moscow")
+
+if not (BOT_TOKEN and ADMIN_ID and DATABASE_URL and POLICY_URL and OFFER_URL and ADS_CONSENT_URL):
+    raise RuntimeError("Проверь .env: CASHIER_BOT_TOKEN, ADMIN_ID, DATABASE_URL, POLICY_URL, OFFER_URL, ADS_CONSENT_URL")
+
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("cashier")
+
+# -------------------- DB --------------------
+conn = psycopg.connect(DATABASE_URL, autocommit=True, sslmode="require", row_factory=dict_row)
+cur  = conn.cursor()
+
+cur.execute("""CREATE TABLE IF NOT EXISTS consents(
+  user_id BIGINT PRIMARY KEY,
+  accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);""")
+cur.execute("""CREATE TABLE IF NOT EXISTS products(
+  code TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  price NUMERIC(10,2) NOT NULL,
+  targets JSONB NOT NULL
+);""")
+cur.execute("""CREATE TABLE IF NOT EXISTS orders(
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  product_code TEXT NOT NULL REFERENCES products(code),
+  amount NUMERIC(10,2) NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending/await_receipt/paid/rejected
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);""")
+cur.execute("""CREATE TABLE IF NOT EXISTS receipts(
+  id BIGSERIAL PRIMARY KEY,
+  order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  file_id TEXT NOT NULL,
+  file_type TEXT NOT NULL,  -- photo/document
+  uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);""")
+cur.execute("""CREATE TABLE IF NOT EXISTS tokens(
   token TEXT PRIMARY KEY,
   bot_name TEXT NOT NULL,
   user_id BIGINT NOT NULL,
   expires_at TIMESTAMPTZ NULL
 );""")
-
-db_run("""CREATE TABLE IF NOT EXISTS allowed_users(
+# гарантируем наличие столбца для сроков действия токенов
+cur.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;")
+cur.execute("""CREATE TABLE IF NOT EXISTS allowed_users(
   user_id BIGINT NOT NULL,
   bot_name TEXT NOT NULL,
   PRIMARY KEY(user_id, bot_name)
 );""")
+cur.execute("""CREATE TABLE IF NOT EXISTS invoice_requests(
+  id BIGSERIAL PRIMARY KEY,
+  order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed BOOLEAN NOT NULL DEFAULT FALSE
+);""")
 
-# На случай старой схемы:
-db_run("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;")
 
-# ------------------ Данные/сессии ------------------
-WELCOME = (
-    "👋 Привет! Ты в боте «Твоя распаковка и анализ ЦА» — он поможет:\n"
-    "• распаковать твою экспертную личность;\n"
-    "• сформировать позиционирование и BIO;\n"
-    "• подробно разобрать продукт/услугу;\n"
-    "• провести анализ ЦА по JTBD.\n\n"
-    "🔐 Доступ выдаётся по персональной ссылке от кассира.\n"
-    "✅ Открой меня по своей ссылке и нажми «СТАРТ»."
+# Каталог базовых цен (без фото-бота)
+CATALOG = {
+    "unpack": {"title": "Бот №1 «Распаковка + Анализ ЦА (JTBD)»",        "price": 2990.00, "targets": [BOT_UNPACK]},
+    "copy":   {"title": "Бот №2 «Твой личный контент-помощник»",         "price": 5490.00, "targets": [BOT_COPY]},
+    "b12":    {"title": "Пакет «Распаковка + контент»",                  "price": 7990.00, "targets": [BOT_UNPACK, BOT_COPY]},
+}
+for code, p in CATALOG.items():
+    cur.execute(
+        """INSERT INTO products(code, title, price, targets)
+           VALUES (%s,%s,%s,%s::jsonb)
+           ON CONFLICT (code) DO UPDATE SET title=EXCLUDED.title, price=EXCLUDED.price, targets=EXCLUDED.targets""",
+        (code, p["title"], p["price"], json.dumps(p["targets"]))
+    )
+
+# -------------------- Utils --------------------
+def set_consent(user_id: int):
+    cur.execute("INSERT INTO consents(user_id, accepted_at) VALUES(%s, now()) ON CONFLICT DO NOTHING", (user_id,))
+
+def get_product(code: str) -> Optional[dict]:
+    cur.execute("SELECT * FROM products WHERE code=%s", (code,))
+    return cur.fetchone()
+
+def current_price(code: str) -> float:
+    base = float(get_product(code)["price"])
+    if PROMO_ACTIVE and code in PROMO_PRICES:
+        return float(PROMO_PRICES[code])
+    return base
+
+def create_order(user_id: int, code: str) -> int:
+    price = current_price(code)
+    cur.execute(
+        "INSERT INTO orders(user_id, product_code, amount, status) VALUES(%s,%s,%s,'pending') RETURNING id",
+        (user_id, code, price)
+    )
+    return cur.fetchone()["id"]
+
+def set_status(order_id: int, status: str):
+    cur.execute("UPDATE orders SET status=%s WHERE id=%s", (status, order_id))
+
+def get_order(order_id: int) -> Optional[dict]:
+    cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
+    return cur.fetchone()
+
+def gen_tokens_with_ttl(user_id: int, targets: list[str], ttl_hours: int):
+    links = []
+    expires_at = datetime.utcnow() + timedelta(hours=ttl_hours) if ttl_hours > 0 else None
+    for bot_name in targets:
+        token = secrets.token_urlsafe(8)
+        cur.execute(
+            "INSERT INTO tokens(token, bot_name, user_id, expires_at) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (token, bot_name, user_id, expires_at)
+        )
+        links.append((bot_name, f"https://t.me/{bot_name}?start={token}"))
+    return links
+
+def shop_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Оплатить бота «Распаковка + Анализ ЦА»",         callback_data="buy:unpack")],
+        [InlineKeyboardButton("Оплатить бота «Твой личный контент-помощник»",   callback_data="buy:copy")],
+        [InlineKeyboardButton("Оплатить ботов «Распаковка+контент»",            callback_data="buy:b12")],
+        [InlineKeyboardButton("📄 Загрузить чек",                                callback_data="upload_receipt")],
+    ])
+
+PROMO_TEXT = (
+    "🎁 Специальные цены для моей аудитории (только 2 дня)\n\n"
+    "🛠 Боты по отдельности\n"
+    "• «Распаковка + Анализ ЦА» — <s>2 990 ₽</s> → 1 890 ₽ (выгода 1 100 ₽)\n"
+    "• «Твой личный контент-помощник» — <s>5 490 ₽</s> → 2 490 ₽ (выгода 3 000 ₽)\n\n"
+    "💎 Пакет — ещё выгоднее\n"
+    "• Боты «Распаковка+контент» — <s>7 990 ₽</s> → 3 990 ₽ (выгода 4 000 ₽)"
+)
+ABOUT_BOTS = (
+    "Бот №1 «Распаковка + Анализ ЦА (JTBD)» — про понимание, что клиенты реально «покупают», "
+    "и как под это подстроить позиционирование и контент.\n\n"
+    "Бот №2 «Твой личный контент-помощник» — контент-план, посты, Reels/Stories, визуальные подсказки "
+    "на основе распаковки."
 )
 
-INTERVIEW_Q = [
-    "1. Расскажи о своём профессиональном опыте. Чем ты занимаешься?",
-    "2. Что вдохновляет тебя в твоей работе?",
-    "3. Какие ценности ты считаешь ключевыми в жизни и в деятельности?",
-    "4. В чём ты видишь свою миссию или предназначение?",
-    "5. Что ты считаешь своим главным достижением?",
-    "6. Какие черты характера помогают тебе в работе?",
-    "7. Есть ли у тебя принципы или убеждения, которыми ты руководствуешься?",
-    "8. Какие темы тебе особенно близки и важны?",
-    "9. Какими знаниями и навыками ты особенно гордишься?",
-    "10. Какие проблемы тебе особенно хочется решить с помощью своей деятельности?",
-    "11. Как ты хочешь, чтобы тебя воспринимали клиенты или подписчики?",
-    "12. Какие эмоции ты хочешь вызывать у своей аудитории?",
-    "13. В чём ты отличаешься от других в своей нише?",
-    "14. Какой образ ты стремишься создать в социальных сетях?",
-    "15. Что ты хочешь, чтобы люди говорили о тебе после взаимодействия с твоим контентом или продуктом?"
-]
-
-PRODUCT_Q = [
-    "1. Опиши свой продукт/услугу максимально просто.",
-    "2. Чем он реально помогает клиенту?",
-    "3. В чем твое/его главное отличие от других решений на рынке?",
-    "4. Какой главный результат получает человек после взаимодействия с тобой или твоим продуктом?"
-]
-
-MAIN_MENU = [
-    ("📱 BIO", "bio"),
-    ("🎯 Продукт / Услуга", "product"),
-    ("🔍 Анализ ЦА", "jtbd")
-]
-
-sessions = {}
-
-# ------------------ Доступ ------------------
-def is_allowed(user_id: int) -> bool:
-    row = db_run(
-        "SELECT 1 FROM allowed_users WHERE user_id=%s AND bot_name=%s",
-        (user_id, BOT_NAME),
-        fetch="one",
-    )
-    return row is not None
-
-def try_accept_token(user_id: int, token: str) -> tuple[bool, str]:
-    if not token:
-        return False, "⛔ Доступ по персональной ссылке. Попросите кассира выдать доступ."
-
-    row = db_run("SELECT * FROM tokens WHERE token=%s", (token,), fetch="one")
-    if not row:
-        return False, "⛔ Ссылка недействительна или уже активирована."
-
-    if row["bot_name"] != BOT_NAME:
-        return False, "⛔ Этот токен выдан для другого бота."
-
-    exp = row.get("expires_at")
-    if exp and datetime.utcnow() > exp.replace(tzinfo=None):
-        return False, "⛔ Срок действия ссылки истёк. Попросите кассира выдать новую."
-
-    # OK — фиксируем доступ и сжигаем токен
-    db_run(
-        "INSERT INTO allowed_users(user_id, bot_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-        (user_id, BOT_NAME)
-    )
-    db_run("DELETE FROM tokens WHERE token=%s", (token,))
-    return True, "✅ Доступ активирован. Можно пользоваться ботом."
-
-def _uid_from_update(update):
-    if getattr(update, "effective_user", None):
-        return update.effective_user.id
-    if getattr(update, "callback_query", None):
-        return update.callback_query.from_user.id
-    return None
-
-def require_access(fn):
-    """Декоратор: пропускает только тех, у кого активирован доступ (кроме /start)."""
-    async def wrapper(update, context, *args, **kwargs):
-        uid = _uid_from_update(update)
-        if ADMIN_ID and uid == ADMIN_ID:
-            return await fn(update, context, *args, **kwargs)
-        if uid is None or not is_allowed(uid):
-            if getattr(update, "message", None):
-                await update.message.reply_text("⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
-            elif getattr(update, "callback_query", None):
-                await update.callback_query.answer("⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.", show_alert=True)
-            return
-        return await fn(update, context, *args, **kwargs)
-    return wrapper
-
-async def send_welcome(ctx: ContextTypes.DEFAULT_TYPE, uid: int):
-    # Кнопка согласия, чтобы перейти к интервью
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Согласен(а) — начать распаковку", callback_data="agree")]
-    ])
-    # Инициализация сессии
-    sessions[uid] = {
-        "stage": "welcome",
-        "answers": [],
-        "product_answers": [],
-        "products": []
-    }
-    await ctx.bot.send_message(chat_id=uid, text=WELCOME, reply_markup=kb)
-
-# ------------------ HANDLERS ------------------
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    args = ctx.args or []
-
-    # Уже есть доступ? Показываем приветствие и стартовый экран
-    if is_allowed(uid):
-        await update.message.reply_text("🔓 Доступ уже активирован. Запускаю распаковку.")
-        await send_welcome(ctx, uid)
+# ----- Примеры ответов -----
+async def send_examples_screens(ctx, chat_id: int):
+    ids = [fid for fid in EXAMPLE_IDS if fid]
+    if not ids:
         return
-
-    # Пробуем принять токен из /start <token>
-    token = args[0] if args else ""
-    ok, msg = try_accept_token(uid, token)
-    await update.message.reply_text(msg)
-
-    if ok:
-        # Сразу запускаем сценарий
-        await send_welcome(ctx, uid)
-        return
-    else:
-        # Без токена — дальше не идём
-        return
-
-# Админ: ручная генерация токена в Postgres для этого бота
-async def gentoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-    if not ctx.args or not ctx.args[0].isdigit():
-        await update.message.reply_text("Использование: /gentoken <user_id>")
-        return
-    target_id = int(ctx.args[0])
-    token = secrets.token_urlsafe(8)
-    # без TTL (или добавь expires_at теперь()+interval)
-    db_run(
-        "INSERT INTO tokens(token, bot_name, user_id, expires_at) VALUES(%s,%s,%s,NULL) ON CONFLICT DO NOTHING",
-        (token, BOT_NAME, target_id)
-    )
-    link = f"https://t.me/{BOT_NAME}?start={token}"
-    await update.message.reply_text(
-        f"✅ Токен: <code>{token}</code>\n🔗 Ссылка: {link}",
-        parse_mode="HTML"
-    )
-
-@require_access
-async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    query = update.callback_query
-    data = query.data
-    sess = sessions.get(cid)
-    await query.answer()
-    if not sess:
-        return
-
-    # --- Согласие ---
-    if sess["stage"] == "welcome" and data == "agree":
-        sess["stage"] = "interview"
-        await ctx.bot.send_message(
-            chat_id=cid,
-            text="✅ Спасибо за согласие!\n\nТеперь начнём распаковку личности.\nЯ задам тебе 15 вопросов — отвечай подробно и честно 👇"
-        )
-        await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[0])
-        return
-
-    # --- BIO по кнопке ---
-    if sess["stage"] == "done_interview" and data == "bio":
-        sess["stage"] = "bio"
-        await generate_bio(cid, sess, ctx)
-        return
-
-    # --- Переход к продукту ---
-    if sess["stage"] in ("done_interview", "done_bio") and data == "product":
-        sess["stage"] = "product_ask"
-        sess["product_answers"] = []
-        await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[0])
-        return
-
-    # --- Следующий продукт (мультипродукт!) ---
-    if sess["stage"] == "product_finished" and data == "add_product":
-        sess["stage"] = "product_ask"
-        sess["product_answers"] = []
-        await ctx.bot.send_message(chat_id=cid, text="Окей! Расскажи о новом продукте 👇\n" + PRODUCT_Q[0])
-        return
-
-    if sess["stage"] == "product_finished" and data == "finish_products":
-        await ctx.bot.send_message(chat_id=cid, text="Переходим к анализу ЦА...")
-        await start_jtbd(cid, sess, ctx)
-        return
-
-    # --- Переход к JTBD ---
-    if sess["stage"] in ("done_interview", "done_bio", "done_product") and data == "jtbd":
-        await start_jtbd(cid, sess, ctx)
-        return
-
-    # JTBD ещё раз или завершить
-    if sess["stage"] == "jtbd_done" and data == "jtbd_again":
-        await start_jtbd(cid, sess, ctx)
-        return
-    if sess["stage"] == "jtbd_done" and data == "finish_unpack":
-        await ctx.bot.send_message(
-            chat_id=cid,
-            text="✅ Распаковка завершена!\n\n"
-                 "Спасибо за работу! Теперь ты можешь использовать Контент-ассистента для стратегий и идей. "
-                 "Если нужна помощь — пиши!"
-        )
-        return
-
-    if data == "jtbd_more" and sess.get("stage") == "jtbd_first":
-        await handle_more_jtbd(update, ctx)
-        return
-
-    if data == "jtbd_done" and sess.get("stage") == "jtbd_first":
-        await handle_skip_jtbd(update, ctx)
-        return
-
-@require_access
-async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    sess = sessions.get(cid)
-    text = (update.message.text or "").strip()
-    if not sess:
-        return
-
-@require_access
-async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    sess = sessions.get(cid)
-    text = (update.message.text or "").strip()
-
-    # Если сессии нет (например, бот рестартанулся) — покажем приветствие
-    if not sess:
-        await send_welcome(ctx, cid)
-        return
-
-    # ---------- INTERVIEW FLOW ----------
-    if sess["stage"] == "interview":
-        sess["answers"].append(text)
+    media = []
+    for i, fid in enumerate(ids):
         try:
-            comment = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "Ты — поддерживающий коуч. На «ты». Дай короткий комментарий к ответу — по теме, дружелюбно, без вопросов."},
-                    {"role": "user", "content": text}
-                ]
-            )
-            await ctx.bot.send_message(chat_id=cid, text=comment.choices[0].message.content)
+            if i == 0:
+                media.append(InputMediaPhoto(media=fid, caption="Примеры ответов ботов"))
+            else:
+                media.append(InputMediaPhoto(media=fid))
         except Exception as e:
-            await ctx.bot.send_message(chat_id=cid, text="⚠️ Не удалось получить комментарий, но мы продолжаем.")
-            print("OpenAI comment error:", e)
+            log.warning("Bad example file_id skipped: %s", e)
+    if media:
+        try:
+            await ctx.bot.send_media_group(chat_id=chat_id, media=media)
+        except Exception as e:
+            log.warning("send_media_group error: %s", e)
 
-        idx = len(sess["answers"])
-        if idx < len(INTERVIEW_Q):
-            await ctx.bot.send_message(chat_id=cid, text=INTERVIEW_Q[idx])
-        else:
-            print(f"[INFO] Завершаем интервью для cid {cid}")
-            await finish_interview(cid, sess, ctx)
-        return
+# ----- Напоминания об окончании акции (T-48/T-24) -----
+def get_audience_user_ids() -> list[int]:
+    cur.execute("SELECT user_id FROM consents")
+    return [r["user_id"] for r in cur.fetchall()]
 
-    # ---------- PRODUCT FLOW с мультипродуктом ----------
-    if sess["stage"] == "product_ask":
-        sess["product_answers"].append(text)
-        idx = len(sess["product_answers"])
-        if idx < len(PRODUCT_Q):
-            await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[idx])
-        else:
-            # Сохраняем продукт (все его ответы)
-            sess.setdefault("products", []).append(sess["product_answers"].copy())
-            await generate_product_analysis(cid, sess, ctx)
-            # Спрашиваем: есть ли ещё продукты?
-            kb = [
-                [InlineKeyboardButton("Добавить ещё продукт", callback_data="add_product")],
-                [InlineKeyboardButton("Перейти к анализу ЦА", callback_data="finish_products")]
-            ]
-            await ctx.bot.send_message(
-                chat_id=cid,
-                text="Спасибо! Все ответы по продукту получены.\nХочешь рассказать ещё об одном продукте?",
-                reply_markup=InlineKeyboardMarkup(kb)
+async def job_promo_countdown(ctx: ContextTypes.DEFAULT_TYPE):
+    hours_left = ctx.job.data
+    if hours_left == 48:
+        text = "⏰ Через 2 суток спеццены закончатся. Успейте оформить заказ по акции."
+    elif hours_left == 24:
+        text = "⏰ Через сутки спеццены закончатся. Последний шанс купить выгодно."
+    else:
+        text = f"⏰ Напоминание: осталось ~{hours_left} часов до окончания акции."
+    kb = shop_keyboard()
+    for uid in get_audience_user_ids():
+        try:
+            await ctx.bot.send_message(uid, text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+
+# -------------------- Handlers --------------------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # 1) Сначала «О разработчике» (кнопка, если задана)
+    if DEV_INFO_URL:
+        dev_kb = InlineKeyboardMarkup([[InlineKeyboardButton("👩‍💻 Информация о разработчике", url=DEV_INFO_URL)]])
+        await update.message.reply_text("Коротко обо мне:", reply_markup=dev_kb)
+
+    # 2) Кружок (если указан file_id)
+    if DEV_VIDEO_NOTE_ID:
+        try:
+            await ctx.bot.send_video_note(chat_id=uid, video_note=DEV_VIDEO_NOTE_ID)
+        except Exception as e:
+            log.warning("video note send error: %s", e)
+
+    # 3) Юридический «гейт» — ссылки только в кнопках
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Политика конфиденциальности", url=POLICY_URL)],
+        [InlineKeyboardButton("📜 Договор оферты",              url=OFFER_URL)],
+        [InlineKeyboardButton("✉️ Согласие на рекламу",        url=ADS_CONSENT_URL)],
+        [InlineKeyboardButton("✅ Согласен — перейти к оплате", callback_data="consent_ok")],
+    ])
+    await ctx.bot.send_message(
+        chat_id=uid,
+        text="Перед оплатой подтвердите согласие с условиями. Нажимая «✅ Согласен — перейти к оплате», вы принимаете условия.",
+        reply_markup=kb
+    )
+
+async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    data = q.data or ""
+    # тост на каждое нажатие
+    try:
+        await q.answer("⏳ Обрабатываю…", show_alert=False)
+    except Exception:
+        pass
+
+    try:
+        if data == "consent_ok":
+            set_consent(uid)
+            await safe_edit(q, PROMO_TEXT, parse_mode="HTML")
+            await ctx.bot.send_message(chat_id=uid, text="Выберите продукт для оформления заказа:", reply_markup=shop_keyboard())
+            await ctx.bot.send_message(chat_id=uid, text=ABOUT_BOTS)
+            # await send_examples_screens(ctx, uid)
+            return
+
+        if data == "upload_receipt":
+            await ctx.bot.send_message(uid, "📎 Пришлите фото или PDF вашего чека одним сообщением. Я проверю и пришлю доступ.")
+            return
+
+        if data.startswith("buy:"):
+            code = data.split(":", 1)[1]
+            prod = get_product(code)
+            if not prod:
+                await q.edit_message_text("Продукт не найден. Обновите витрину: /start")
+                return
+            order_id = create_order(uid, code)
+            price = current_price(code)
+            set_status(order_id, "await_receipt")
+
+            old = float(prod["price"])
+            old_line = f"Старая цена: <s>{old:.2f} ₽</s>\n" if PROMO_ACTIVE else ""
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Отправить чек по этому заказу", callback_data=f"send_receipt:{order_id}")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="go_shop")]
+            ])
+            await q.edit_message_text(
+                f"🧾 <b>{prod['title']}</b>\n"
+                f"{old_line}"
+                f"Сумма к оплате: <b>{price:.2f} ₽</b>\n\n"
+                f"Оплата по номеру телефона на карту {PAY_BANK}:\n"
+                f"• Номер: <code>{PAY_PHONE}</code>\n"
+                f"• Получатель: <b>{PAY_NAME}</b>\n"
+                f"• Комментарий к переводу: <code>ORDER-{order_id}</code>\n\n"
+                "После оплаты вернитесь и нажмите «📤 Отправить чек по этому заказу» "
+                "или «📄 Загрузить чек» внизу витрины.",
+                parse_mode="HTML",
+                reply_markup=kb
             )
-            sess["stage"] = "product_finished"
+            return
+
+        if data.startswith("send_receipt:"):
+            order_id = int(data.split(":", 1)[1])
+            order = get_order(order_id)
+            if not order or order["user_id"] != uid:
+                await q.edit_message_text("Заказ не найден. Откройте витрину: /start")
+                return
+            await q.edit_message_text("Загрузите чек (фото или PDF) одним сообщением. После проверки пришлю доступ.")
+            return
+
+        # --- админские действия ---
+        if data.startswith("confirm:") or data.startswith("reject:") \
+           or data.startswith("send_invoice:") or data.startswith("close_invoice:"):
+            if uid != ADMIN_ID:
+                try:
+                    await q.answer("Нет прав.", show_alert=True)
+                except Exception:
+                    pass
+                return
+
+            if data.startswith("confirm:") or data.startswith("reject:"):
+                order_id = int(data.split(":", 1)[1])
+                order = get_order(order_id)
+                if not order:
+                    await q.edit_message_text("Заказ не найден.")
+                    return
+
+                if data.startswith("reject:"):
+                    set_status(order_id, "rejected")
+                    await safe_edit(q, f"Заказ #{order_id}: отклонён.", reply_markup=None)
+                    try:
+                        await ctx.bot.send_message(
+                            order["user_id"],
+                            "❌ Оплата не подтверждена. Если это ошибка — загрузите чек ещё раз."
+                        )
+                    except Exception:
+                        pass
+                    return
+
+
+                # confirm
+                set_status(order_id, "paid")
+                prod  = get_product(order["product_code"])
+                links = gen_tokens_with_ttl(order["user_id"], prod["targets"], TOKEN_TTL_HOURS)
+
+                warn = (
+                    "✅ Чек проверен.\n\n"
+                    "⚠️ Ссылки индивидуальные. Они действуют ограниченное время "
+                    f"(~{TOKEN_TTL_HOURS} ч) и перестают работать после активации."
+                )
+                btns = [[InlineKeyboardButton(f"Открыть @{bn}", url=link)] for bn, link in links]
+
+                await safe_edit(q, f"Заказ #{order_id}: подтверждён. Ссылки отправлены.", reply_markup=None)
+
+                try:
+                    await ctx.bot.send_message(
+                        order["user_id"], warn,
+                        reply_markup=InlineKeyboardMarkup(btns), parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+                return
+
+
+            if data.startswith("close_invoice:"):
+                order_id = int(data.split(":", 1)[1])
+                cur.execute("UPDATE invoice_requests SET closed=TRUE WHERE order_id=%s", (order_id,))
+                await safe_edit(f"Запрос на чек по заказу #{order_id} закрыт.")
+                return
+
+        if data.startswith("request_invoice:"):
+            order_id = int(data.split(":", 1)[1])
+            order = get_order(order_id)
+            if not order or order["user_id"] != uid:
+                await q.answer("Заказ не найден.", show_alert=True)
+                return
+            cur.execute(
+                "INSERT INTO invoice_requests(order_id, closed) VALUES(%s, FALSE) "
+                "ON CONFLICT (order_id) DO UPDATE SET closed=FALSE",
+                (order_id,)
+            )
+            kb_admin = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Отправить чек клиенту", callback_data=f"send_invoice:{order_id}")],
+                [InlineKeyboardButton("✅ Закрыть запрос",        callback_data=f"close_invoice:{order_id}")],
+            ])
+            try:
+                await ctx.bot.send_message(ADMIN_ID, f"🧾 Запрос чека по заказу #{order_id}\nПокупатель: {uid}", reply_markup=kb_admin)
+            except Exception:
+                pass
+            await q.answer("Запрос на чек отправлен. Ждём файл от продавца.", show_alert=True)
+            return
+
+        await q.answer("Команда не распознана.", show_alert=False)
+
+    except Exception:
+        log.exception("Callback error for data=%r uid=%s", data, uid)
+        try:
+            await ctx.bot.send_message(uid, "⚠️ Во время обработки произошла ошибка. Попробуйте ещё раз: /start")
+        except Exception:
+            pass
+
+async def receipts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Покупатель отправляет чек (фото/документ). Привяжем к последнему await_receipt и перешлём админу."""
+    uid = update.effective_user.id
+    # последний заказ, который ждёт чека
+    cur.execute("SELECT id FROM orders WHERE user_id=%s AND status='await_receipt' ORDER BY id DESC LIMIT 1", (uid,))
+    row = cur.fetchone()
+    if not row:
+        return
+    order_id = row["id"]
+
+    file_id, file_type = None, None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        file_type = "photo"
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        file_type = "document"
+    if not file_id:
+        await update.message.reply_text("⚠ Пришлите фото или PDF одним сообщением.")
         return
 
-# ------------------ Генерации ------------------
-async def finish_interview(cid, sess, ctx):
-    answers = "\n".join(sess["answers"])
-    style_note = (
-        "\n\nОбрати внимание: используй стиль, лексику, энергетику и выражения, которые пользователь использовал в своих ответах. "
-        "Пиши в его манере — не переусложняй, не добавляй шаблонные фразы, старайся повторять тональность."
-    )
-    unpack = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты профессиональный коуч и бренд-стратег. На основе ответов проведи глубокую, подробную распаковку личности: "
-                    "раскрой ценности, жизненные и профессиональные убеждения, сильные стороны, уникальные черты, мотивы, личную историю, "
-                    "цели, миссию, послание для аудитории, триггеры, раскрывающие потенциал. Пиши на русском языке, с деталями и живыми примерами, "
-                    "разбивая по логическим блокам с подзаголовками. Формат — Markdown."
-                    + style_note
-                )
-            },
-            {"role": "user", "content": answers}
-        ]
-    )
-    unpack_text = unpack.choices[0].message.content
-    sess["unpacking"] = unpack_text
-    await send_long_message(ctx, cid, "✅ Твоя распаковка:\n\n" + unpack_text)
+    cur.execute("INSERT INTO receipts(order_id, file_id, file_type) VALUES(%s,%s,%s)", (order_id, file_id, file_type))
+    set_status(order_id, "pending")
 
-    pos = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты бренд-стратег. На основе распаковки личности подробно сформулируй позиционирование на русском языке "
-                    "в развернутом виде — от лица человека (1–2 абзаца о себе), затем детализируй: "
-                    "— основные направления развития\n"
-                    "— ключевые ценности\n"
-                    "— сильные стороны\n"
-                    "— послание для аудитории\n"
-                    "— миссия\n"
-                    "— слоган (1 фраза)\n"
-                    "— цель сообщества (если есть)\n"
-                    "— уникальность и отличия\n"
-                    "— итоговый призыв к действию\n\n"
-                    "Сначала дай общий абзац о человеке, затем — остальные пункты с подзаголовками и списками. Всё на русском, стильно и вдохновляюще. Формат Markdown."
-                    + style_note
-                )
-            },
-            {"role": "user", "content": unpack_text}
-        ]
-    )
-    positioning_text = pos.choices[0].message.content
-    sess["positioning"] = positioning_text
+    kb_admin = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm:{order_id}"),
+                                      InlineKeyboardButton("❌ Отклонить",   callback_data=f"reject:{order_id}")]])
+    caption = f"💳 Чек по заказу #{order_id}\nПокупатель: {uid}"
+    try:
+        if file_type == "photo":
+            await ctx.bot.send_photo(ADMIN_ID, file_id, caption=caption, reply_markup=kb_admin)
+        else:
+            await ctx.bot.send_document(ADMIN_ID, file_id, caption=caption, reply_markup=kb_admin)
+    except Exception:
+        pass
+    await update.message.reply_text("✅ Чек отправлен на проверку. Ожидайте ответа.")
 
-    await send_long_message(ctx, cid, "🎯 Позиционирование:\n\n" + positioning_text)
+# --- Админ: отправка своего чека клиенту после запроса (если используешь запросы) ---
+async def admin_invoice_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    cur.execute("SELECT order_id FROM invoice_requests WHERE closed=FALSE ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return
+    order_id = row["order_id"]
+    order = get_order(order_id)
+    if not order:
+        return
 
-    sess["stage"] = "done_interview"
-    kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
-    await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+    file_id, is_photo = None, False
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id; is_photo = True
+    elif update.message.document:
+        file_id = update.message.document.file_id
+    if not file_id:
+        return
 
-async def generate_bio(cid, sess, ctx):
-    style_note = "\n\nОбрати внимание: используй стиль и лексику пользователя, пиши фразы в его манере."
-    prompt = (
-        "На основе позиционирования сгенерируй 5 вариантов короткого BIO для шапки профиля Instagram на русском языке. "
-        "Каждый вариант — 2–3 цепляющих, лаконичных фразы подряд, разделённых слэшами («/»), без списков, без заголовков и пояснений, не более 180 символов. "
-        "Варианты пиши только текстом, без оформления Markdown и без номеров. Формулировки — живые, в стиле Instagram: вызывай интерес, добавь call-to-action или эмоцию."
-        + style_note + "\n\n" + sess["positioning"]
-    )
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
-    await ctx.bot.send_message(chat_id=cid, text="📱 Варианты BIO:\n\n" + resp.choices[0].message.content)
-    sess["stage"] = "done_bio"
-    kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU if c != "bio"]
-    await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
+    try:
+        if is_photo:
+            await ctx.bot.send_photo(order["user_id"], file_id, caption="🧾 Чек от продавца")
+        else:
+            await ctx.bot.send_document(order["user_id"], file_id, caption="🧾 Чек от продавца")
+        cur.execute("UPDATE invoice_requests SET closed=TRUE WHERE order_id=%s", (order_id,))
+        await update.message.reply_text(f"Чек отправлен покупателю (заказ #{order_id}). Запрос закрыт.")
+    except Exception:
+        pass
 
-async def generate_product_analysis(cid, sess, ctx):
-    style_note = "\n\nСохраняй стиль, лексику и тональность пользователя (ориентируйся на его оригинальные формулировки)."
-    answers = "\n".join(sess["product_answers"])
-    prompt = (
-        "На основе ответов пользователя на вопросы о продукте, напиши краткий анализ продукта для Telegram в 3–5 предложениях. "
-        "Раскрой суть продукта, ключевые выгоды, отличия от конкурентов, результат для клиента. Язык — русский, стиль деловой, но понятный."
-        + style_note + "\n\n" + answers
-    )
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
-    await ctx.bot.send_message(chat_id=cid, text="📝 Краткий анализ продукта:\n\n" + resp.choices[0].message.content)
+# --- /vnote: получить file_id кружка ---
+async def help_vnote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text("Пришлите кружок (video note) — верну file_id.")
 
-async def send_long_message(ctx, cid, text):
-    MAX_LEN = 4000
-    for i in range(0, len(text), MAX_LEN):
-        await ctx.bot.send_message(chat_id=cid, text=text[i:i+MAX_LEN], parse_mode="HTML")
+async def detect_vnote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if update.message.video_note:
+        await update.message.reply_text(f"file_id кружка: {update.message.video_note.file_id}\nСкопируйте в .env как DEV_VIDEO_NOTE_ID")
 
-@require_access
-async def start_jtbd(cid, sess, ctx):
-    all_products = []
-    for prod in sess.get("products", []):
-        all_products.append("\n".join(prod))
-    ctx_text = "\n".join(sess["answers"]) + "\n" + "\n\n".join(all_products)
-    style_note = "\n\nПиши подробно, с примерами, в стиле и лексике пользователя. Избегай шаблонных формулировок и повторов."
-    prompt = (
-        "На основе распаковки, позиционирования и всех продуктов составь РОВНО 5 ключевых сегментов целевой аудитории (ЦА), строго по шаблону и с HTML-разметкой:\n\n"
-        "<b>Сегмент 1: ...</b>\n"
-        "<u>JTBD:</u> ...\n\n"
-        "<u>Потребности:</u> ...\n\n"
-        "<u>Боли:</u> ...\n\n"
-        "<u>Решения:</u> ...\n\n"
-        "<u>Темы для контента:</u> ...\n\n"
-        "<u>Психографика:</u> ...\n\n"
-        "<u>Поведенческая сегментация:</u> ...\n\n"
-        "<u>Оффер:</u> ...\n\n"
-        "Оформи строго 5 таких сегментов, каждый — отдельным блоком. Только HTML-теги для оформления. Ответ только на русском языке."
-        + style_note +
-        "\n\nИсходная информация:\n" + ctx_text
-    )
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
-    await send_long_message(ctx, cid, "🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content)
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text="Хочешь увидеть неочевидные сегменты ЦА?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Хочу дополнительные сегменты", callback_data="jtbd_more")],
-            [InlineKeyboardButton("Хватит, благодарю", callback_data="jtbd_done")]
-        ])
-    )
-    sess["stage"] = "jtbd_first"
+# --- /photoid: выдать file_id примера (админ) ---
+async def cmd_photoid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    m = update.message
+    if m and m.reply_to_message and m.reply_to_message.photo:
+        await m.reply_text(f"[ADMIN] example file_id: {m.reply_to_message.photo[-1].file_id}")
+        return
+    if m and m.photo:
+        await m.reply_text(f"[ADMIN] example file_id: {m.photo[-1].file_id}")
+        return
+    await m.reply_text("Пришлите фото и ответьте на него командой /photoid (как reply).")
 
-@require_access
-async def handle_more_jtbd(update, ctx):
-    cid = update.effective_chat.id
-    sess = sessions.get(cid)
-    all_products = []
-    for prod in sess.get("products", []):
-        all_products.append("\n".join(prod))
-    ctx_text = "\n".join(sess["answers"]) + "\n" + "\n\n".join(all_products)
-    style_note = (
-        "\n\nПиши подробно, в стиле пользователя, избегай шаблонов и повторов. Для каждого сегмента дай не менее 5 идей для контента. "
-        "Психографику разбей на интересы, ценности, страхи."
-    )
-    prompt = (
-        "Добавь ещё 3 неочевидных сегмента целевой аудитории (ЦА), строго по шаблону и с HTML-разметкой... "
-        + style_note + "\n\nИсходная информация:\n" + ctx_text
-    )
-    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
-    await send_long_message(ctx, cid, "🔍 Дополнительные неочевидные сегменты:\n\n" + resp.choices[0].message.content)
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text="Что дальше?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Проанализировать ЦА ещё раз", callback_data="jtbd_again")],
-            [InlineKeyboardButton("Завершить распаковку", callback_data="finish_unpack")]
-        ])
-    )
-    sess["stage"] = "jtbd_done"
+async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Нажмите /start.")
 
-@require_access
-async def handle_skip_jtbd(update, ctx):
-    cid = update.effective_chat.id
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text=(
-            "Принято! 👌\n\n"
-            "Если захочешь сделать следующий шаг и системно работать с контентом — знай, что у меня есть Контент-ассистент 🤖\n\n"
-            "Он поможет:\n"
-            "• создать стратегию под любую соцсеть\n"
-            "• сформировать рубрики и контент-план\n"
-            "• написать посты, сторис и даже сценарии видео\n\n"
-            "Подключим его?"
-        ),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🪄 Получить доступ", callback_data="get_access")],
-            [InlineKeyboardButton("✅ Уже в арсенале", callback_data="have")],
-            [InlineKeyboardButton("⏳ Обращусь позже", callback_data="later")]
-        ])
-    )
-    sessions[cid]["stage"] = "jtbd_done"
-
-# ------------------ MAIN ------------------
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    log.info("run_polling... token prefix: %s******", (BOT_TOKEN or "")[:10])
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("gentoken", gentoken))  # админская
+    app.add_handler(CommandHandler("vnote", help_vnote))
+    app.add_handler(CommandHandler("photoid", cmd_photoid))
+    app.add_handler(CallbackQueryHandler(cb))
 
-    # кнопки/сообщения
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(CallbackQueryHandler(handle_more_jtbd, pattern="jtbd_more"))
-    app.add_handler(CallbackQueryHandler(handle_skip_jtbd, pattern="jtbd_done"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # клиент присылает чек
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, receipts))
+    # админ присылает кружок — получить file_id
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE & ~filters.COMMAND, detect_vnote))
+    # админ загружает чек для клиента (после запроса)
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, admin_invoice_upload))
+    # текст —fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+
+    # --- Два одноразовых напоминания: T-48h и T-24h до конца акции ---
+    if PROMO_END_ISO:
+        try:
+            tz = ZoneInfo(TIMEZONE)
+            promo_end = datetime.fromisoformat(PROMO_END_ISO)
+            if promo_end.tzinfo is None:
+                promo_end = promo_end.replace(tzinfo=tz)
+
+            t_minus_48 = promo_end - timedelta(hours=48)
+            t_minus_24 = promo_end - timedelta(hours=24)
+            now = datetime.now(promo_end.tzinfo)
+
+            if t_minus_48 > now:
+                app.job_queue.run_once(job_promo_countdown, when=t_minus_48, data=48, name="promo_Tminus48h")
+                log.info("Scheduled T-48h at %s", t_minus_48.isoformat())
+
+            if t_minus_24 > now:
+                app.job_queue.run_once(job_promo_countdown, when=t_minus_24, data=24, name="promo_Tminus24h")
+                log.info("Scheduled T-24h at %s", t_minus_24.isoformat())
+
+        except Exception as e:
+            log.warning("PROMO countdown schedule error: %s", e)
 
     app.run_polling()
 
