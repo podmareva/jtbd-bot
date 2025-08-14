@@ -271,8 +271,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_allowed(uid):
         await update.message.reply_text("🔓 Доступ уже активирован. Продолжаем.")
-        # тут — твоя обычная логика старта/меню
+        
+        # 👇 Показываем стартовое приветствие и меню
+        kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
+        await ctx.bot.send_message(chat_id=uid, text=WELCOME, reply_markup=InlineKeyboardMarkup(kb))
+        
+        # создаём сессию, если вдруг нет
+        sessions[uid] = {"stage": "welcome", "answers": []}
         return
+
 
     token = args[0] if args else ""
     ok, msg = try_accept_token(uid, token)
