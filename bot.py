@@ -249,22 +249,16 @@ def ensure_allowed_or_reply(update, ctx) -> bool:
     """Вернёт True, если доступ есть. Иначе — сообщение пользователю и False."""
     uid = update.effective_user.id
     if is_allowed(uid):
-        await update.message.reply_text("🔓 Доступ уже активирован.")
-        
-        # Приветствие и кнопка согласия
-        kb = [[InlineKeyboardButton("🚀 Начать распаковку", callback_data="agree")]]
-        await ctx.bot.send_message(
-            chat_id=uid,
-            text=WELCOME,
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-        
-        # создаём сессию
-        sessions[uid] = {
-            "stage": "welcome",
-            "answers": []
-        }
-        return
+        return True
+    try:
+        if update.message:
+            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
+        elif update.callback_query:
+            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
+    except Exception:
+        pass
+    return False
+
 
 # ---------- HANDLERS ----------
 
@@ -272,19 +266,51 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
+    uid = update.effective_user.id
     args = ctx.args or []
 
+    # Если пользователь уже авторизован
     if is_allowed(uid):
-        await update.message.reply_text("🔓 Доступ уже активирован. Продолжаем.")
+        await update.message.reply_text("🔓 Доступ уже активирован.")
         
-        # 👇 Показываем стартовое приветствие и меню
-        kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
-        await ctx.bot.send_message(chat_id=uid, text=WELCOME, reply_markup=InlineKeyboardMarkup(kb))
-        
-        # создаём сессию, если вдруг нет
-        sessions[uid] = {"stage": "welcome", "answers": []}
+        # Приветствие и кнопка "Начать распаковку"
+        kb = [[InlineKeyboardButton("🚀 Начать распаковку", callback_data="agree")]]
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=WELCOME,
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+        # Создаём или сбрасываем сессию
+        sessions[uid] = {
+            "stage": "welcome",
+            "answers": []
+        }
         return
+
+    # Если доступ ещё не активирован — проверяем токен
+    token = args[0] if args else ""
+    ok, msg = try_accept_token(uid, token)
+    await update.message.reply_text(msg)
+
+    if ok:
+        # Показываем приветствие и кнопку согласия
+        kb = [[InlineKeyboardButton("🚀 Начать распаковку", callback_data="agree")]]
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=WELCOME,
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+        # Создаём сессию
+        sessions[uid] = {
+            "stage": "welcome",
+            "answers": []
+        }
+        return
+    else:
+        return
+
 
 
     token = args[0] if args else ""
