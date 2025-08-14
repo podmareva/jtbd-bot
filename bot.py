@@ -181,25 +181,42 @@ def require_access(fn):
         return await fn(update, context, *args, **kwargs)
     return wrapper
 
+async def send_welcome(ctx: ContextTypes.DEFAULT_TYPE, uid: int):
+    # Кнопка согласия, чтобы перейти к интервью
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Согласен(а) — начать распаковку", callback_data="agree")]
+    ])
+    # Инициализация сессии
+    sessions[uid] = {
+        "stage": "welcome",
+        "answers": [],
+        "product_answers": [],
+        "products": []
+    }
+    await ctx.bot.send_message(chat_id=uid, text=WELCOME, reply_markup=kb)
+
 # ------------------ HANDLERS ------------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     args = ctx.args or []
 
-    # уже есть доступ?
+    # Уже есть доступ? Показываем приветствие и стартовый экран
     if is_allowed(uid):
-        await update.message.reply_text("🔓 Доступ уже активирован. Продолжаем.")
-        # здесь можно показать первое меню, если нужно
+        await update.message.reply_text("🔓 Доступ уже активирован. Запускаю распаковку.")
+        await send_welcome(ctx, uid)
         return
 
-    # пробуем принять токен из /start <token>
+    # Пробуем принять токен из /start <token>
     token = args[0] if args else ""
     ok, msg = try_accept_token(uid, token)
     await update.message.reply_text(msg)
+
     if ok:
-        # здесь можно показать первое меню, если нужно
+        # Сразу запускаем сценарий
+        await send_welcome(ctx, uid)
         return
     else:
+        # Без токена — дальше не идём
         return
 
 # Админ: ручная генерация токена в Postgres для этого бота
@@ -300,6 +317,17 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = sessions.get(cid)
     text = (update.message.text or "").strip()
     if not sess:
+        return
+
+@require_access
+async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    sess = sessions.get(cid)
+    text = (update.message.text or "").strip()
+
+    # Если сессии нет (например, бот рестартанулся) — покажем приветствие
+    if not sess:
+        await send_welcome(ctx, cid)
         return
 
     # ---------- INTERVIEW FLOW ----------
