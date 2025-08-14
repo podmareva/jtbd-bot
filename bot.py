@@ -249,16 +249,22 @@ def ensure_allowed_or_reply(update, ctx) -> bool:
     """Вернёт True, если доступ есть. Иначе — сообщение пользователю и False."""
     uid = update.effective_user.id
     if is_allowed(uid):
-        return True
-    # если пришёл без токена, не пускаем в остальной функционал
-    try:
-        if update.message:
-            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
-        elif update.callback_query:
-            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
-    except Exception:
-        pass
-    return False
+        await update.message.reply_text("🔓 Доступ уже активирован.")
+        
+        # Приветствие и кнопка согласия
+        kb = [[InlineKeyboardButton("🚀 Начать распаковку", callback_data="agree")]]
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=WELCOME,
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        
+        # создаём сессию
+        sessions[uid] = {
+            "stage": "welcome",
+            "answers": []
+        }
+        return
 
 # ---------- HANDLERS ----------
 
