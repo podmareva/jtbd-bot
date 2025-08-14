@@ -564,18 +564,27 @@ async def send_long_message(ctx, cid, text):
 
 # ---------- JTBD (5 сегментов, учёт всех продуктов, стиль пользователя) ----------
 async def start_jtbd(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):  # update не нужен тут
         return
+
+    # ✅ Проверка, что есть все нужные данные
+    if not sess.get("answers") or not sess.get("products"):
+        await ctx.bot.send_message(
+            chat_id=cid,
+            text="❗️Пожалуйста, сначала пройди этапы распаковки и описания продукта."
+        )
+        return
+
     all_products = []
     for prod in sess.get("products", []):
         all_products.append("\n".join(prod))
     ctx_text = "\n".join(sess["answers"]) + "\n" + "\n\n".join(all_products)
+
     style_note = (
         "\n\nПиши подробно, с примерами, в стиле и лексике пользователя. Избегай шаблонных формулировок и повторов."
     )
     prompt = (
         "На основе распаковки, позиционирования и всех продуктов составь РОВНО 5 ключевых сегментов целевой аудитории (ЦА), строго по шаблону и с HTML-разметкой:\n\n"
-        "Каждый сегмент оформляй так (пример ниже):\n\n"
         "<b>Сегмент 1: Любители уюта и красоты</b>\n"
         "\n"
         "<u>JTBD:</u> Создать уютное и красивое пространство для себя и близких, чтобы чувствовать себя комфортно и радостно.\n\n"
@@ -592,12 +601,23 @@ async def start_jtbd(cid, sess, ctx):
         + style_note +
         "\n\nИсходная информация:\n" + ctx_text
     )
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
+
+    # ✅ GPT-запрос с обработкой ошибок
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}]
+        )
+    except Exception as e:
+        await ctx.bot.send_message(
+            chat_id=cid,
+            text="⚠️ Не удалось получить анализ ЦА. Попробуй ещё раз позже."
+        )
+        print("OpenAI JTBD error:", e)
+        return
+
     await send_long_message(ctx, cid, "🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content)
-    # Кнопка для доп. сегментов
+
     await ctx.bot.send_message(
         chat_id=cid,
         text="Хочешь увидеть неочевидные сегменты ЦА?",
