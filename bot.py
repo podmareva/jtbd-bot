@@ -10,13 +10,37 @@ from telegram.ext import (
 )
 import openai
 
+import os
+from datetime import datetime
+import psycopg
+from psycopg.rows import dict_row
+from dotenv import load_dotenv
+
 # ---------- НАСТРОЙКИ ----------
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-MAIN_BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "MainBotName")  # указать в .env
+DATABASE_URL = os.getenv("DATABASE_URL")
+BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "jtbd_assistant_bot")
+
+conn = psycopg.connect(DATABASE_URL, autocommit=True, sslmode="require", row_factory=dict_row)
+cur  = conn.cursor()
+
+# Таблицы те же, что у кассира
+cur.execute("""CREATE TABLE IF NOT EXISTS tokens(
+  token TEXT PRIMARY KEY,
+  bot_name TEXT NOT NULL,
+  user_id BIGINT NOT NULL,
+  expires_at TIMESTAMPTZ NULL
+);""")
+
+cur.execute("""CREATE TABLE IF NOT EXISTS allowed_users(
+  user_id BIGINT NOT NULL,
+  bot_name TEXT NOT NULL,
+  PRIMARY KEY(user_id, bot_name)
+);""")
 
 # ---------- SQLite: ДОСТУП ЧЕРЕЗ ТОКЕН ----------
 
@@ -61,10 +85,8 @@ WELCOME = (
     "• сформировать позиционирование и BIO;\n"
     "• подробно разобрать продукт/услугу;\n"
     "• провести анализ ЦА по JTBD.\n\n"
-    "🔐 Чтобы начать, подтверди согласие с "
-    "[Политикой конфиденциальности](https://docs.google.com/document/d/1UUyKq7aCbtrOT81VBVwgsOipjtWpro7v/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true) и "
-    "[Договором‑офертой](https://docs.google.com/document/d/1zY2hl0ykUyDYGQbSygmcgY2JaVMMZjQL/edit?usp=drive_link&ouid=104429050326439982568&rtpof=true&sd=true).\n\n"
-    "✅ Нажми «СОГЛАСЕН/СОГЛАСНА» — и поехали!"
+    "🔐 Чтобы начать"
+    "✅ Нажми «СТАРТ» — и поехали!"
 )
 
 INTERVIEW_Q = [
@@ -100,33 +122,80 @@ MAIN_MENU = [
 
 sessions = {}
 
+def is_allowed(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM allowed_users WHERE user_id=%s AND bot_name=%s", (user_id, BOT_USERNAME))
+    return cur.fetchone() is not None
+
+def try_accept_token(user_id: int, token: str) -> tuple[bool, str]:
+    """
+    Принять токен из /start <token>. Если валиден — дать доступ и сжечь токен.
+    """
+    if not token:
+        return False, "⛔ Доступ по персональной ссылке. Попросите кассира выдать доступ."
+
+    cur.execute("SELECT * FROM tokens WHERE token=%s", (token,))
+    row = cur.fetchone()
+    if not row:
+        return False, "⛔ Ссылка недействительна или уже активирована."
+
+    if row["bot_name"] != BOT_USERNAME:
+        return False, "⛔ Этот токен выдан для другого бота."
+
+    exp = row["expires_at"]
+    if exp and datetime.utcnow() > exp.replace(tzinfo=None):
+        return False, "⛔ Срок действия ссылки истёк. Попросите кассира выдать новую."
+
+    # OK — фиксируем доступ и сжигаем токен
+    cur.execute(
+        "INSERT INTO allowed_users(user_id, bot_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+        (user_id, BOT_USERNAME)
+    )
+    cur.execute("DELETE FROM tokens WHERE token=%s", (token,))
+    return True, "✅ Доступ активирован. Можно пользоваться ботом."
+
+def ensure_allowed_or_reply(update, ctx) -> bool:
+    """Вернёт True, если доступ есть. Иначе — сообщение пользователю и False."""
+    uid = update.effective_user.id
+    if is_allowed(uid):
+        return True
+    # если пришёл без токена, не пускаем в остальной функционал
+    try:
+        if update.message:
+            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
+        elif update.callback_query:
+            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
+    except Exception:
+        pass
+    return False
+
 # ---------- HANDLERS ----------
 
+from telegram import Update
+from telegram.ext import ContextTypes
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
+    args = ctx.args or []
 
-    # --- Доступ по токену ---
-    args = ctx.args if hasattr(ctx, "args") else []
-    if args:
-        token = args[0]
-        valid, reason = validate_token(token, user_id)
-        if not valid:
-            await ctx.bot.send_message(chat_id=cid, text=f"⛔️ {reason}")
-            return
+    # Уже есть доступ?
+    if is_allowed(uid):
+        await update.message.reply_text("🔓 Доступ уже активирован. Продолжаем работу.")
+        # TODO: здесь вызови свой обычный старт/меню распаковщика
+        # await show_main_menu(update, ctx)
+        return
+
+    # Пробуем принять токен из /start <token>
+    token = args[0] if args else ""
+    ok, msg = try_accept_token(uid, token)
+    await update.message.reply_text(msg)
+
+    if ok:
+        # TODO: здесь вызови свой обычный старт/меню распаковщика
+        # await show_main_menu(update, ctx)
+        return
     else:
-        if user_id != ADMIN_ID:
-            await ctx.bot.send_message(chat_id=cid, text="⛔️ Нет доступа. Получи персональную ссылку у администратора.")
-            return
-
-    sessions[cid] = {
-        "stage": "welcome",
-        "answers": [],
-        "product_answers": [],
-        "products": []
-    }
-    kb = [[InlineKeyboardButton("✅ СОГЛАСЕН/СОГЛАСНА", callback_data="agree")]]
-    await ctx.bot.send_message(chat_id=cid, text=WELCOME, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        # Без доступа — останавливаемся
+        return
 
 async def gentoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
@@ -152,6 +221,8 @@ async def gentoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     cid = update.effective_chat.id
     query = update.callback_query
     data = query.data
@@ -222,6 +293,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     cid = update.effective_chat.id
     sess = sessions.get(cid)
     text = update.message.text.strip()
@@ -278,6 +351,8 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Здесь идут другие этапы, если есть
 
 async def finish_interview(cid, sess, ctx):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     print(f"[INFO] Генерация распаковки для cid {cid}")
     answers = "\n".join(sess["answers"])
     style_note = (
@@ -342,6 +417,8 @@ async def finish_interview(cid, sess, ctx):
 
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     style_note = (
         "\n\nОбрати внимание: используй стиль и лексику пользователя, пиши фразы в его манере."
     )
@@ -371,6 +448,8 @@ async def generate_bio(cid, sess, ctx):
 
 # ---------- КРАТКИЙ АНАЛИЗ ПРОДУКТА (учёт стиля пользователя) ----------
 async def generate_product_analysis(cid, sess, ctx):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     style_note = (
         "\n\nСохраняй стиль, лексику и тональность пользователя (ориентируйся на его оригинальные формулировки)."
     )
@@ -399,6 +478,8 @@ async def send_long_message(ctx, cid, text):
 
 # ---------- JTBD (5 сегментов, учёт всех продуктов, стиль пользователя) ----------
 async def start_jtbd(cid, sess, ctx):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     all_products = []
     for prod in sess.get("products", []):
         all_products.append("\n".join(prod))
@@ -442,6 +523,8 @@ async def start_jtbd(cid, sess, ctx):
     sess["stage"] = "jtbd_first"
 
 async def handle_more_jtbd(update, ctx):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     cid = update.effective_chat.id
     sess = sessions.get(cid)
     all_products = []
@@ -486,6 +569,8 @@ async def handle_more_jtbd(update, ctx):
     sess["stage"] = "jtbd_done"
 
 async def handle_skip_jtbd(update, ctx):
+    if not ensure_allowed_or_reply(update, ctx):
+        return
     cid = update.effective_chat.id
     await ctx.bot.send_message(
         chat_id=cid,
