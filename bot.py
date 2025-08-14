@@ -1,92 +1,97 @@
 import os
-import sys
-import sqlite3
+from datetime import datetime
 import secrets
+
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
+
+# если используешь openai — оставь
 import openai
 
-import os
-from datetime import datetime
+# БД (psycopg v3)
 import psycopg
 from psycopg.rows import dict_row
-from dotenv import load_dotenv
 
-# ---------- НАСТРОЙКИ ----------
-
+# ------------------ ENV ------------------
 load_dotenv()
+
 openai.api_key = os.getenv("OPENAI_API_KEY")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-BOT_USERNAME = os.getenv("MAIN_BOT_USERNAME", "jtbd_assistant_bot")
+ADMIN_ID    = int(os.getenv("ADMIN_ID", "0"))
 
-conn = psycopg.connect(DATABASE_URL, autocommit=True, sslmode="require", row_factory=dict_row)
-cur  = conn.cursor()
+# username бота-распаковщика (без @)
+BOT_NAME = os.getenv("MAIN_BOT_USERNAME", "jtbd_assistant_bot")
 
-# Таблицы те же, что у кассира
-cur.execute("""CREATE TABLE IF NOT EXISTS tokens(
+# ------------------ DB runner (без глобального соединения) ------------------
+def db_run(sql: str, args: tuple = (), fetch: str | None = None):
+    """
+    Выполнить SQL с новым подключением и 1 ретраем.
+    fetch=None -> execute
+    fetch='one' -> fetchone()
+    fetch='all' -> fetchall()
+    """
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            sslmode="require",
+            autocommit=True,
+            row_factory=dict_row,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                return None
+    except psycopg.OperationalError:
+        with psycopg.connect(
+            DATABASE_URL,
+            sslmode="require",
+            autocommit=True,
+            row_factory=dict_row,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                return None
+
+# ------------------ Схема БД ------------------
+db_run("""CREATE TABLE IF NOT EXISTS tokens(
   token TEXT PRIMARY KEY,
   bot_name TEXT NOT NULL,
   user_id BIGINT NOT NULL,
   expires_at TIMESTAMPTZ NULL
 );""")
 
-cur.execute("""CREATE TABLE IF NOT EXISTS allowed_users(
+db_run("""CREATE TABLE IF NOT EXISTS allowed_users(
   user_id BIGINT NOT NULL,
   bot_name TEXT NOT NULL,
   PRIMARY KEY(user_id, bot_name)
 );""")
 
-# ---------- SQLite: ДОСТУП ЧЕРЕЗ ТОКЕН ----------
+# На случай старой схемы:
+db_run("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;")
 
-DB_PATH = "tokens.db"
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS tokens (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            used INTEGER DEFAULT 0
-        )
-        """)
-init_db()
-
-def create_token(user_id):
-    token = secrets.token_urlsafe(8)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO tokens (token, user_id, used) VALUES (?, ?, 0)", (token, user_id))
-    return token
-
-def validate_token(token, user_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        res = conn.execute(
-            "SELECT used, user_id FROM tokens WHERE token = ?", (token,)
-        ).fetchone()
-        if not res:
-            return False, "Неверный токен."
-        used, db_uid = res
-        if used:
-            return False, "Токен уже использован."
-        if db_uid != user_id:
-            return False, "Нет доступа. Этот токен для другого пользователя."
-        conn.execute("UPDATE tokens SET used = 1 WHERE token = ?", (token,))
-        return True, None
-
-# ---------- ДАННЫЕ ----------
+# ------------------ Данные/сессии ------------------
 WELCOME = (
     "👋 Привет! Ты в боте «Твоя распаковка и анализ ЦА» — он поможет:\n"
     "• распаковать твою экспертную личность;\n"
     "• сформировать позиционирование и BIO;\n"
     "• подробно разобрать продукт/услугу;\n"
     "• провести анализ ЦА по JTBD.\n\n"
-    "🔐 Чтобы начать"
-    "✅ Нажми «СТАРТ» — и поехали!"
+    "🔐 Доступ выдаётся по персональной ссылке от кассира.\n"
+    "✅ Открой меня по своей ссылке и нажми «СТАРТ»."
 )
 
 INTERVIEW_Q = [
@@ -122,107 +127,104 @@ MAIN_MENU = [
 
 sessions = {}
 
+# ------------------ Доступ ------------------
 def is_allowed(user_id: int) -> bool:
-    cur.execute("SELECT 1 FROM allowed_users WHERE user_id=%s AND bot_name=%s", (user_id, BOT_USERNAME))
-    return cur.fetchone() is not None
+    row = db_run(
+        "SELECT 1 FROM allowed_users WHERE user_id=%s AND bot_name=%s",
+        (user_id, BOT_NAME),
+        fetch="one",
+    )
+    return row is not None
 
 def try_accept_token(user_id: int, token: str) -> tuple[bool, str]:
-    """
-    Принять токен из /start <token>. Если валиден — дать доступ и сжечь токен.
-    """
     if not token:
         return False, "⛔ Доступ по персональной ссылке. Попросите кассира выдать доступ."
 
-    cur.execute("SELECT * FROM tokens WHERE token=%s", (token,))
-    row = cur.fetchone()
+    row = db_run("SELECT * FROM tokens WHERE token=%s", (token,), fetch="one")
     if not row:
         return False, "⛔ Ссылка недействительна или уже активирована."
 
-    if row["bot_name"] != BOT_USERNAME:
+    if row["bot_name"] != BOT_NAME:
         return False, "⛔ Этот токен выдан для другого бота."
 
-    exp = row["expires_at"]
+    exp = row.get("expires_at")
     if exp and datetime.utcnow() > exp.replace(tzinfo=None):
         return False, "⛔ Срок действия ссылки истёк. Попросите кассира выдать новую."
 
     # OK — фиксируем доступ и сжигаем токен
-    cur.execute(
+    db_run(
         "INSERT INTO allowed_users(user_id, bot_name) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-        (user_id, BOT_USERNAME)
+        (user_id, BOT_NAME)
     )
-    cur.execute("DELETE FROM tokens WHERE token=%s", (token,))
+    db_run("DELETE FROM tokens WHERE token=%s", (token,))
     return True, "✅ Доступ активирован. Можно пользоваться ботом."
 
-def ensure_allowed_or_reply(update, ctx) -> bool:
-    """Вернёт True, если доступ есть. Иначе — сообщение пользователю и False."""
-    uid = update.effective_user.id
-    if is_allowed(uid):
-        return True
-    # если пришёл без токена, не пускаем в остальной функционал
-    try:
-        if update.message:
-            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
-        elif update.callback_query:
-            ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
-    except Exception:
-        pass
-    return False
+def _uid_from_update(update):
+    if getattr(update, "effective_user", None):
+        return update.effective_user.id
+    if getattr(update, "callback_query", None):
+        return update.callback_query.from_user.id
+    return None
 
-# ---------- HANDLERS ----------
+def require_access(fn):
+    """Декоратор: пропускает только тех, у кого активирован доступ (кроме /start)."""
+    async def wrapper(update, context, *args, **kwargs):
+        uid = _uid_from_update(update)
+        if ADMIN_ID and uid == ADMIN_ID:
+            return await fn(update, context, *args, **kwargs)
+        if uid is None or not is_allowed(uid):
+            if getattr(update, "message", None):
+                await update.message.reply_text("⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
+            elif getattr(update, "callback_query", None):
+                await update.callback_query.answer("⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.", show_alert=True)
+            return
+        return await fn(update, context, *args, **kwargs)
+    return wrapper
 
-from telegram import Update
-from telegram.ext import ContextTypes
-
+# ------------------ HANDLERS ------------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
     args = ctx.args or []
 
-    # Уже есть доступ?
+    # уже есть доступ?
     if is_allowed(uid):
-        await update.message.reply_text("🔓 Доступ уже активирован. Продолжаем работу.")
-        # TODO: здесь вызови свой обычный старт/меню распаковщика
-        # await show_main_menu(update, ctx)
+        await update.message.reply_text("🔓 Доступ уже активирован. Продолжаем.")
+        # здесь можно показать первое меню, если нужно
         return
 
-    # Пробуем принять токен из /start <token>
+    # пробуем принять токен из /start <token>
     token = args[0] if args else ""
     ok, msg = try_accept_token(uid, token)
     await update.message.reply_text(msg)
-
     if ok:
-        # TODO: здесь вызови свой обычный старт/меню распаковщика
-        # await show_main_menu(update, ctx)
+        # здесь можно показать первое меню, если нужно
         return
     else:
-        # Без доступа — останавливаемся
         return
 
+# Админ: ручная генерация токена в Postgres для этого бота
 async def gentoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if user_id != ADMIN_ID:
-        await ctx.bot.send_message(chat_id=cid, text="⛔️ Только для администратора.")
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только для администратора.")
         return
-
     if not ctx.args or not ctx.args[0].isdigit():
-        await ctx.bot.send_message(chat_id=cid, text="Используй: /gentoken user_id (числовой Telegram ID)")
+        await update.message.reply_text("Использование: /gentoken <user_id>")
         return
-
     target_id = int(ctx.args[0])
-    token = create_token(target_id)
-    link = f"https://t.me/{MAIN_BOT_USERNAME}?start={token}"
-
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text=f"✅ Токен сгенерирован: <code>{token}</code>\n"
-             f"🔗 Ссылка для пользователя:\n{link}",
+    token = secrets.token_urlsafe(8)
+    # без TTL (или добавь expires_at теперь()+interval)
+    db_run(
+        "INSERT INTO tokens(token, bot_name, user_id, expires_at) VALUES(%s,%s,%s,NULL) ON CONFLICT DO NOTHING",
+        (token, BOT_NAME, target_id)
+    )
+    link = f"https://t.me/{BOT_NAME}?start={token}"
+    await update.message.reply_text(
+        f"✅ Токен: <code>{token}</code>\n🔗 Ссылка: {link}",
         parse_mode="HTML"
     )
 
+@require_access
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
     cid = update.effective_chat.id
     query = update.callback_query
     data = query.data
@@ -292,12 +294,11 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_skip_jtbd(update, ctx)
         return
 
+@require_access
 async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
     cid = update.effective_chat.id
     sess = sessions.get(cid)
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
     if not sess:
         return
 
@@ -348,12 +349,8 @@ async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sess["stage"] = "product_finished"
         return
 
-    # Здесь идут другие этапы, если есть
-
+# ------------------ Генерации ------------------
 async def finish_interview(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
-    print(f"[INFO] Генерация распаковки для cid {cid}")
     answers = "\n".join(sess["answers"])
     style_note = (
         "\n\nОбрати внимание: используй стиль, лексику, энергетику и выражения, которые пользователь использовал в своих ответах. "
@@ -379,7 +376,6 @@ async def finish_interview(cid, sess, ctx):
     sess["unpacking"] = unpack_text
     await send_long_message(ctx, cid, "✅ Твоя распаковка:\n\n" + unpack_text)
 
-    print(f"[INFO] Генерация позиционирования для cid {cid}")
     pos = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -407,111 +403,66 @@ async def finish_interview(cid, sess, ctx):
     positioning_text = pos.choices[0].message.content
     sess["positioning"] = positioning_text
 
-    # Разбиваем позиционирование на 2+ сообщений, если очень длинно
     await send_long_message(ctx, cid, "🎯 Позиционирование:\n\n" + positioning_text)
 
     sess["stage"] = "done_interview"
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU]
     await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
-    return
 
-# ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
-    style_note = (
-        "\n\nОбрати внимание: используй стиль и лексику пользователя, пиши фразы в его манере."
-    )
+    style_note = "\n\nОбрати внимание: используй стиль и лексику пользователя, пиши фразы в его манере."
     prompt = (
         "На основе позиционирования сгенерируй 5 вариантов короткого BIO для шапки профиля Instagram на русском языке. "
         "Каждый вариант — 2–3 цепляющих, лаконичных фразы подряд, разделённых слэшами («/»), без списков, без заголовков и пояснений, не более 180 символов. "
         "Варианты пиши только текстом, без оформления Markdown и без номеров. Формулировки — живые, в стиле Instagram: вызывай интерес, добавь call-to-action или эмоцию."
-        + style_note
-        + "\n\n"
-        + sess["positioning"]
+        + style_note + "\n\n" + sess["positioning"]
     )
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text="📱 Варианты BIO:\n\n" + resp.choices[0].message.content
-    )
+    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
+    await ctx.bot.send_message(chat_id=cid, text="📱 Варианты BIO:\n\n" + resp.choices[0].message.content)
     sess["stage"] = "done_bio"
     kb = [[InlineKeyboardButton(n, callback_data=c)] for n, c in MAIN_MENU if c != "bio"]
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text="Что дальше?",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    await ctx.bot.send_message(chat_id=cid, text="Что дальше?", reply_markup=InlineKeyboardMarkup(kb))
 
-# ---------- КРАТКИЙ АНАЛИЗ ПРОДУКТА (учёт стиля пользователя) ----------
 async def generate_product_analysis(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
-    style_note = (
-        "\n\nСохраняй стиль, лексику и тональность пользователя (ориентируйся на его оригинальные формулировки)."
-    )
+    style_note = "\n\nСохраняй стиль, лексику и тональность пользователя (ориентируйся на его оригинальные формулировки)."
     answers = "\n".join(sess["product_answers"])
     prompt = (
         "На основе ответов пользователя на вопросы о продукте, напиши краткий анализ продукта для Telegram в 3–5 предложениях. "
         "Раскрой суть продукта, ключевые выгоды, отличия от конкурентов, результат для клиента. Язык — русский, стиль деловой, но понятный."
-        + style_note
-        + "\n\n"
-        + answers
+        + style_note + "\n\n" + answers
     )
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    await ctx.bot.send_message(
-        chat_id=cid,
-        text="📝 Краткий анализ продукта:\n\n" + resp.choices[0].message.content
-    )
+    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
+    await ctx.bot.send_message(chat_id=cid, text="📝 Краткий анализ продукта:\n\n" + resp.choices[0].message.content)
 
-# ---------- ДЛИННОСООБЩЕНИЯ ----------
 async def send_long_message(ctx, cid, text):
     MAX_LEN = 4000
     for i in range(0, len(text), MAX_LEN):
         await ctx.bot.send_message(chat_id=cid, text=text[i:i+MAX_LEN], parse_mode="HTML")
 
-# ---------- JTBD (5 сегментов, учёт всех продуктов, стиль пользователя) ----------
+@require_access
 async def start_jtbd(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
     all_products = []
     for prod in sess.get("products", []):
         all_products.append("\n".join(prod))
     ctx_text = "\n".join(sess["answers"]) + "\n" + "\n\n".join(all_products)
-    style_note = (
-        "\n\nПиши подробно, с примерами, в стиле и лексике пользователя. Избегай шаблонных формулировок и повторов."
-    )
+    style_note = "\n\nПиши подробно, с примерами, в стиле и лексике пользователя. Избегай шаблонных формулировок и повторов."
     prompt = (
         "На основе распаковки, позиционирования и всех продуктов составь РОВНО 5 ключевых сегментов целевой аудитории (ЦА), строго по шаблону и с HTML-разметкой:\n\n"
-        "Каждый сегмент оформляй так (пример ниже):\n\n"
-        "<b>Сегмент 1: Любители уюта и красоты</b>\n"
-        "\n"
-        "<u>JTBD:</u> Создать уютное и красивое пространство для себя и близких, чтобы чувствовать себя комфортно и радостно.\n\n"
-        "<u>Потребности:</u> Уют, красота, эстетическое удовольствие, создание атмосферы.\n\n"
-        "<u>Боли:</u> Недостаток времени на создание уюта, нехватка идей для декора, стресс от некомфортного интерьера.\n\n"
-        "<u>Решения:</u> Услуги по дизайну интерьера, предоставление дизайн-проектов помещений, консультации по созданию уютного и стильного интерьера.\n\n"
-        "<u>Темы для контента:</u> «5 способов создать уют в доме», «Как выбрать цветовую гамму для интерьера», «ТОП-10 украшений для создания уюта», «Дизайн интерьера: тренды и идеи», «Как сделать атмосферу в спальне».\n\n"
-        "<u>Психографика:</u> Ценят уют, комфорт, красоту, стремятся создать особую атмосферу в своём доме.\n\n"
-        "<u>Поведенческая сегментация:</u> Активно изучают дизайн интерьера, следят за интерьерными новинками, делятся своими решениями в социальных сетях.\n\n"
-        "<u>Оффер:</u> Консультация и подбор идей для уютного дома от профессионального дизайнера.\n\n"
-        "Оформи строго 5 таких сегментов, каждый — отдельным блоком. Не сокращай, не ограничивай себя по объёму. Каждый критерий — отдельной строкой. "
-        "Название сегмента делай <b>жирным</b>, критерии (<u>JTBD:</u>, <u>Потребности:</u> и т.д.) — подчёркнутыми, между критериями и сегментами делай пустую строку. "
-        "Не используй таблицы и списки. Только HTML-теги для оформления. Ответ только на русском языке."
+        "<b>Сегмент 1: ...</b>\n"
+        "<u>JTBD:</u> ...\n\n"
+        "<u>Потребности:</u> ...\n\n"
+        "<u>Боли:</u> ...\n\n"
+        "<u>Решения:</u> ...\n\n"
+        "<u>Темы для контента:</u> ...\n\n"
+        "<u>Психографика:</u> ...\n\n"
+        "<u>Поведенческая сегментация:</u> ...\n\n"
+        "<u>Оффер:</u> ...\n\n"
+        "Оформи строго 5 таких сегментов, каждый — отдельным блоком. Только HTML-теги для оформления. Ответ только на русском языке."
         + style_note +
         "\n\nИсходная информация:\n" + ctx_text
     )
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
+    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
     await send_long_message(ctx, cid, "🎯 Основные сегменты ЦА:\n\n" + resp.choices[0].message.content)
-    # Кнопка для доп. сегментов
     await ctx.bot.send_message(
         chat_id=cid,
         text="Хочешь увидеть неочевидные сегменты ЦА?",
@@ -522,9 +473,8 @@ async def start_jtbd(cid, sess, ctx):
     )
     sess["stage"] = "jtbd_first"
 
+@require_access
 async def handle_more_jtbd(update, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
     cid = update.effective_chat.id
     sess = sessions.get(cid)
     all_products = []
@@ -536,27 +486,10 @@ async def handle_more_jtbd(update, ctx):
         "Психографику разбей на интересы, ценности, страхи."
     )
     prompt = (
-        "Добавь ещё 3 неочевидных сегмента целевой аудитории (ЦА), строго по шаблону и с HTML-разметкой:\n\n"
-        "<b>Сегмент 6: Ценители уюта и необычных решений</b>\n"
-        "\n"
-        "<u>JTBD:</u> Найти идеи для создания стильного и уютного пространства, чтобы проявить индивидуальность.\n\n"
-        "<u>Потребности:</u> Атмосфера, комфорт, оригинальные детали, простота реализации.\n\n"
-        "<u>Боли:</u> Неумение реализовать задумку самостоятельно, страх ошибок в декоре.\n\n"
-        "<u>Решения:</u> Видеоинструкции, подбор материалов, сопровождение на всех этапах.\n\n"
-        "<u>Темы для контента:</u> «5 нестандартных решений для малогабаритной квартиры», «Как объединить разные стили», «ТОП-10 уютных аксессуаров», «Провальные идеи декора: как не повторить», «Где искать вдохновение».\n\n"
-        "<u>Психографика:</u> Интересы — интерьер, Pinterest, скандинавский стиль; ценности — индивидуальность, комфорт; страхи — показаться банальным.\n\n"
-        "<u>Поведенческая сегментация:</u> Активно ищут необычные идеи, участвуют в челленджах, делятся примерами, смотрят блоги о дизайне.\n\n"
-        "<u>Оффер:</u> Создай уют без ошибок — получи подборку идей и бесплатную консультацию по твоей задумке!\n\n"
-        "Оформи строго 3 таких новых неочевидных сегмента, каждый — отдельным блоком. Не сокращай, не ограничивай себя по объёму. Каждый критерий — отдельной строкой. "
-        "Название сегмента делай <b>жирным</b>, критерии (<u>JTBD:</u>, <u>Потребности:</u> и т.д.) — подчёркнутыми, между критериями и сегментами делай пустую строку. "
-        "Не используй таблицы и списки. Только HTML-теги для оформления. Ответ только на русском языке."
-        + style_note +
-        "\n\nИсходная информация:\n" + ctx_text
+        "Добавь ещё 3 неочевидных сегмента целевой аудитории (ЦА), строго по шаблону и с HTML-разметкой... "
+        + style_note + "\n\nИсходная информация:\n" + ctx_text
     )
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
+    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
     await send_long_message(ctx, cid, "🔍 Дополнительные неочевидные сегменты:\n\n" + resp.choices[0].message.content)
     await ctx.bot.send_message(
         chat_id=cid,
@@ -568,36 +501,42 @@ async def handle_more_jtbd(update, ctx):
     )
     sess["stage"] = "jtbd_done"
 
+@require_access
 async def handle_skip_jtbd(update, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
-        return
     cid = update.effective_chat.id
     await ctx.bot.send_message(
         chat_id=cid,
-        text="Поняла! 😊\n\n"
-             "Если захочешь сделать следующий шаг и системно работать с контентом — знай, что у меня есть Контент-ассистент 🤖\n\n"
-             "Он поможет:\n"
-             "• создать стратегию под любую соцсеть\n"
-             "• сформировать рубрики и контент-план\n"
-             "• написать посты, сторис и даже сценарии видео\n\n"
-             "Подключим его?",
+        text=(
+            "Принято! 👌\n\n"
+            "Если захочешь сделать следующий шаг и системно работать с контентом — знай, что у меня есть Контент-ассистент 🤖\n\n"
+            "Он поможет:\n"
+            "• создать стратегию под любую соцсеть\n"
+            "• сформировать рубрики и контент-план\n"
+            "• написать посты, сторис и даже сценарии видео\n\n"
+            "Подключим его?"
+        ),
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🪄 Получить доступ", callback_data="get_access")],
             [InlineKeyboardButton("✅ Уже в арсенале", callback_data="have")],
             [InlineKeyboardButton("⏳ Обращусь позже", callback_data="later")]
         ])
     )
-    sessions[cid]["stage"] = "done_jtbd"
+    sessions[cid]["stage"] = "jtbd_done"
 
-# ---------- MAIN ----------
+# ------------------ MAIN ------------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("gentoken", gentoken))
+    app.add_handler(CommandHandler("gentoken", gentoken))  # админская
+
+    # кнопки/сообщения
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(CallbackQueryHandler(handle_more_jtbd, pattern="jtbd_more"))
     app.add_handler(CallbackQueryHandler(handle_skip_jtbd, pattern="jtbd_done"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
     app.run_polling()
 
 if __name__ == "__main__":
