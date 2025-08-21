@@ -347,7 +347,7 @@ async def gentoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):
         return
     cid = update.effective_chat.id
     query = update.callback_query
