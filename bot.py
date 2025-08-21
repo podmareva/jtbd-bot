@@ -557,7 +557,7 @@ async def finish_interview(cid, sess, ctx):
 
 # ---------- BIO ----------
 async def generate_bio(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):
         return
     style_note = (
         "\n\nОбрати внимание: используй стиль и лексику пользователя, пиши фразы в его манере."
