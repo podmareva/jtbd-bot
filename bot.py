@@ -246,7 +246,8 @@ def require_access(fn):
     return wrapper
 
 def ensure_allowed_or_reply(update, ctx) -> bool:
-    """Вернёт True, если доступ есть. Иначе — сообщение пользователю и False."""
+    if update is None:
+        return True
     uid = update.effective_user.id
     if is_allowed(uid):
         return True
