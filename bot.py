@@ -372,13 +372,13 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- BIO по кнопке ---
-    if sess["stage"] == "done_interview" and data == "bio":
+    if sess["stage"] in ("done_interview", "product_finished", "jtbd_done", "done_bio") and data == "bio":
         sess["stage"] = "bio"
         await generate_bio(cid, sess, ctx)
         return
 
     # --- Переход к продукту ---
-    if sess["stage"] in ("done_interview", "done_bio") and data == "product":
+    if sess["stage"] in ("done_interview", "done_bio", "jtbd_done", "product_finished") and data == "product":
         sess["stage"] = "product_ask"
         sess["product_answers"] = []
         await ctx.bot.send_message(chat_id=cid, text=PRODUCT_Q[0])
@@ -397,7 +397,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Переход к JTBD ---
-    if sess["stage"] in ("done_interview", "done_bio", "done_product") and data == "jtbd":
+    if sess["stage"] in ("done_interview", "done_bio", "done_product", "product_finished") and data == "jtbd":
         await start_jtbd(cid, sess, ctx)
         return
 
