@@ -415,11 +415,11 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "jtbd_more" and sess.get("stage") == "jtbd_first":
-        await handle_more_jtbd(update, ctx)
+        await handle_more_jtbd(update=None, ctx=ctx)
         return
 
     if data == "jtbd_done" and sess.get("stage") == "jtbd_first":
-        await handle_skip_jtbd(update, ctx)
+        await handle_skip_jtbd(update=None, ctx=ctx)
         return
 
 async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -588,7 +588,7 @@ async def generate_bio(cid, sess, ctx):
 
 # ---------- КРАТКИЙ АНАЛИЗ ПРОДУКТА (учёт стиля пользователя) ----------
 async def generate_product_analysis(cid, sess, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):
         return
     style_note = (
         "\n\nСохраняй стиль, лексику и тональность пользователя (ориентируйся на его оригинальные формулировки)."
@@ -683,7 +683,7 @@ async def start_jtbd(cid, sess, ctx):
     sess["stage"] = "jtbd_first"
 
 async def handle_more_jtbd(update, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):
         return
     cid = update.effective_chat.id
     sess = sessions.get(cid)
@@ -729,7 +729,7 @@ async def handle_more_jtbd(update, ctx):
     sess["stage"] = "jtbd_done"
 
 async def handle_skip_jtbd(update, ctx):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):
         return
     cid = update.effective_chat.id
     await ctx.bot.send_message(
