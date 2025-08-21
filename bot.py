@@ -574,7 +574,7 @@ async def generate_bio(cid, sess, ctx):
     )
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
         timeout=25
     )
     await ctx.bot.send_message(
@@ -606,7 +606,7 @@ async def generate_product_analysis(cid, sess, ctx):
     )
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
         timeout=25
     )
     await ctx.bot.send_message(
