@@ -247,10 +247,12 @@ def require_access(fn):
 
 def ensure_allowed_or_reply(update, ctx) -> bool:
     if update is None:
-        return True
+        return True  # или False, если хочешь блокировать
+
     uid = update.effective_user.id
     if is_allowed(uid):
         return True
+
     try:
         if update.message:
             ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
@@ -258,6 +260,7 @@ def ensure_allowed_or_reply(update, ctx) -> bool:
             ctx.bot.send_message(chat_id=uid, text="⛔ Доступ не активирован. Откройте бота по персональной ссылке от кассира.")
     except Exception:
         pass
+
     return False
 
 
@@ -420,7 +423,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ensure_allowed_or_reply(update, ctx):
+    if not ensure_allowed_or_reply(update=None, ctx=ctx):
         return
     cid = update.effective_chat.id
     sess = sessions.get(cid)
